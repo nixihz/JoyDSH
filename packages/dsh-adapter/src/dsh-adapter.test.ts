@@ -11,7 +11,7 @@ class FakeSocket implements WebSocketLike {
     this.listeners.set(type, listeners)
   }
 
-  emit(type: 'open' | 'message', event: Event | MessageEvent = new Event(type)): void {
+  emit(type: 'open' | 'message' | 'error' | 'close', event: Event | MessageEvent = new Event(type)): void {
     for (const listener of this.listeners.get(type) ?? []) listener(event)
   }
 
@@ -43,6 +43,39 @@ describe('DSH 适配契约', () => {
       new URL('http://127.0.0.1:43127/api/session.create'),
       expect.objectContaining({ method: 'POST' }),
     )
+  })
+
+  it('列出会话时读取自动生成的标题投影', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { rpcId: string }
+      return Response.json({
+        type: 'server-response',
+        rpcId: request.rpcId,
+        result: {
+          ok: true,
+          value: {
+            items: [{
+              sessionId: 'session-1',
+              updatedAt: 100,
+              running: false,
+              blank: false,
+              cwd: '/tmp/joydsh',
+              projections: { asOfSeq: 4, values: { title: '自动命名会话' } },
+            }],
+          },
+        },
+      })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    await expect(adapter.listTasks()).resolves.toEqual([{
+      id: 'session-1',
+      title: '自动命名会话',
+      workspacePath: '/tmp/joydsh',
+      running: false,
+      blank: false,
+      updatedAt: 100,
+    }])
   })
 
   it('DSH 返回错误时拒绝命令并保留错误码', async () => {
@@ -102,11 +135,16 @@ describe('DSH 适配契约', () => {
         return socket
       },
     })
-    const events: string[] = []
+    const events: Array<{ taskId: string | undefined, type: string, sequence: number | undefined, data: unknown }> = []
     const states: string[] = []
 
     const unsubscribe = adapter.subscribe({
-      onEvent: event => events.push(`${event.taskId}:${event.type}:${event.sequence}`),
+      onEvent: event => events.push({
+        taskId: event.taskId,
+        type: event.type,
+        sequence: event.sequence,
+        data: event.data,
+      }),
       onConnectionChange: state => states.push(state),
     })
     sockets[0]?.emit('open')
@@ -122,6 +160,19 @@ describe('DSH 适配契约', () => {
         },
       }),
     } as MessageEvent)
+    sockets[0]?.emit('message', {
+      data: JSON.stringify({
+        type: 'server-request',
+        rpcId: 'projection-1',
+        payload: {
+          type: 'session/projection',
+          sessionId: 'session-1',
+          key: 'title',
+          value: '自动命名会话',
+          seq: 3,
+        },
+      }),
+    } as MessageEvent)
     unsubscribe()
 
     expect(urls).toEqual([
@@ -129,8 +180,78 @@ describe('DSH 适配契约', () => {
       'ws://127.0.0.1:43127/api/events.host',
     ])
     expect(states).toEqual(['connecting', 'connected'])
-    expect(events).toEqual(['session-1:assistant/message:2'])
+    expect(events).toEqual([
+      {
+        taskId: 'session-1',
+        type: 'assistant/message',
+        sequence: 2,
+        data: { text: '完成' },
+      },
+      {
+        taskId: 'session-1',
+        type: 'session/projection',
+        sequence: undefined,
+        data: {
+          type: 'session/projection',
+          sessionId: 'session-1',
+          key: 'title',
+          value: '自动命名会话',
+          seq: 3,
+        },
+      },
+    ])
     expect(sockets.every(socket => socket.closed)).toBe(true)
+  })
+
+  it('连接失败后进入 disconnected 并在静默重试期间避免 connecting 闪烁', () => {
+    vi.useFakeTimers()
+    try {
+      const sockets: FakeSocket[] = []
+      const adapter = new DshHttpAdapter({
+        baseUrl: 'http://127.0.0.1:43127',
+        webSocketFactory: () => {
+          const socket = new FakeSocket()
+          sockets.push(socket)
+          return socket
+        },
+      })
+      const states: string[] = []
+
+      const unsubscribe = adapter.subscribe({
+        onEvent: () => {},
+        onConnectionChange: state => states.push(state),
+      })
+
+      expect(states).toEqual(['connecting'])
+
+      // 初始连接失败 -> 进入 disconnected
+      sockets[0]?.emit('error')
+      sockets[1]?.emit('close')
+      expect(states).toEqual(['connecting', 'disconnected'])
+
+      // 500ms 后后台静默重试第 1 次，如果仍未连上，不应向 UI 广播 connecting
+      vi.advanceTimersByTime(500)
+      expect(states).toEqual(['connecting', 'disconnected'])
+
+      // 重试再次失败 -> 依然保持 disconnected，不产生冗余通知
+      const retrySocketMux = sockets[2]
+      const retrySocketHost = sockets[3]
+      retrySocketMux?.emit('error')
+      retrySocketHost?.emit('close')
+      expect(states).toEqual(['connecting', 'disconnected'])
+
+      // 再次经过 500ms 后重试成功 -> 两个 socket 都 open -> 通知 connected
+      vi.advanceTimersByTime(500)
+      const successSocketMux = sockets[4]
+      const successSocketHost = sockets[5]
+      successSocketMux?.emit('open')
+      successSocketHost?.emit('open')
+      expect(states).toEqual(['connecting', 'disconnected', 'connected'])
+
+      unsubscribe()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('查询并只写保存模型凭据', async () => {
@@ -392,5 +513,90 @@ describe('DSH 适配契约', () => {
         },
       },
     }])
+  })
+
+  it('发送图文与纯图片提示词', async () => {
+    const requests: Array<{ method: string, payload: unknown }> = []
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { rpcId: string, method: string, payload: unknown }
+      requests.push({ method: request.method, payload: request.payload })
+      return Response.json({
+        type: 'server-response',
+        rpcId: request.rpcId,
+        result: { ok: true, value: { accepted: true } },
+      })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    // 图文混合
+    await adapter.sendInput('session-1', '查看此图', [
+      { id: 'img-1', mediaType: 'image/png', data: 'data:image/png;base64,iVBORw0KGgo=', name: 'screenshot.png' },
+    ])
+    // 纯图
+    await adapter.sendInput('session-1', '', [
+      { id: 'img-2', mediaType: 'image/jpeg', data: '/9j/4AAQSkZJRg==', name: 'photo.jpg' },
+    ])
+
+    expect(requests.map(r => ({
+      method: r.method,
+      content: (r.payload as { content: unknown }).content,
+    }))).toEqual([
+      {
+        method: 'session.prompt',
+        content: [
+          { type: 'text', text: '查看此图' },
+          { type: 'image', mediaType: 'image/png', data: 'iVBORw0KGgo=', name: 'screenshot.png' },
+        ],
+      },
+      {
+        method: 'session.prompt',
+        content: [
+          { type: 'image', mediaType: 'image/jpeg', data: '/9j/4AAQSkZJRg==', name: 'photo.jpg' },
+        ],
+      },
+    ])
+  })
+
+  it('按需拉取历史会话附件', async () => {
+    const requests: Array<{ method: string, payload: unknown }> = []
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { rpcId: string, method: string, payload: unknown }
+      requests.push({ method: request.method, payload: request.payload })
+      return Response.json({
+        type: 'server-response',
+        rpcId: request.rpcId,
+        result: {
+          ok: true,
+          value: {
+            attachment: {
+              attachmentId: 'att-1',
+              mediaType: 'image/png',
+              bytes: 1024,
+              width: 800,
+              height: 600,
+              name: 'arch.png',
+            },
+            data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+          },
+        },
+      })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    const res = await adapter.getAttachment('session-1', 'att-1')
+    expect(res).toEqual({
+      attachment: {
+        attachmentId: 'att-1',
+        mediaType: 'image/png',
+        bytes: 1024,
+        width: 800,
+        height: 600,
+        name: 'arch.png',
+      },
+      data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    })
+    expect(requests).toEqual([
+      { method: 'session.attachment', payload: { sessionId: 'session-1', attachmentId: 'att-1' } },
+    ])
   })
 })

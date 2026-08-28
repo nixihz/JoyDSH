@@ -1,7 +1,35 @@
-import type { RuntimeHealth, TaskApproval, TaskApprovalOutcome, TaskEvent, TaskPermissionMode, TaskSession } from '@joydsh/domain'
+import type {
+  ImageAttachmentInput,
+  ImageAttachmentRef,
+  ImageMediaType,
+  RuntimeHealth,
+  TaskApproval,
+  TaskApprovalOutcome,
+  TaskEvent,
+  TaskPermissionMode,
+  TaskSession,
+} from '@joydsh/domain'
 import { z } from 'zod'
 
 const DSH_VERSION = '0.1.1-rc.2'
+
+const imageAttachmentRefSchema = z.object({
+  attachmentId: z.string(),
+  mediaType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
+  bytes: z.number(),
+  width: z.number(),
+  height: z.number(),
+  name: z.string().optional(),
+  originalDimensions: z.object({
+    width: z.number(),
+    height: z.number(),
+  }).optional(),
+})
+
+const sessionAttachmentValueSchema = z.object({
+  attachment: imageAttachmentRefSchema,
+  data: z.string(),
+})
 
 const rpcErrorSchema = z.object({
   code: z.string(),
@@ -24,6 +52,10 @@ const sessionSummarySchema = z.object({
   running: z.boolean(),
   blank: z.boolean(),
   cwd: z.string().optional(),
+  projections: z.object({
+    asOfSeq: z.number().int(),
+    values: z.object({ title: z.string().nullable().optional() }).passthrough(),
+  }).optional(),
 })
 
 const sessionEventSchema = z.object({
@@ -129,7 +161,8 @@ export interface DshAdapter {
   listTasks(): Promise<TaskSession[]>
   createTask(input: { workspacePath: string }): Promise<TaskSession>
   replayTask(taskId: string): Promise<TaskEvent[]>
-  sendInput(taskId: string, text: string): Promise<void>
+  sendInput(taskId: string, text: string, images?: readonly ImageAttachmentInput[]): Promise<void>
+  getAttachment(taskId: string, attachmentId: string): Promise<{ attachment: ImageAttachmentRef; data: string }>
   setTaskPermission(taskId: string, mode: TaskPermissionMode): Promise<void>
   respondToApproval(taskId: string, approval: TaskApproval, outcome: TaskApprovalOutcome): Promise<void>
   pauseTask(taskId: string): Promise<void>
@@ -204,13 +237,45 @@ export class DshHttpAdapter implements DshAdapter {
     return value.events.map(({ event }) => toSessionTaskEvent(taskId, event))
   }
 
-  async sendInput(taskId: string, text: string): Promise<void> {
+  async sendInput(taskId: string, text: string, images?: readonly ImageAttachmentInput[]): Promise<void> {
+    const content: Array<
+      | { type: 'text'; text: string }
+      | { type: 'image'; mediaType: ImageMediaType; data: string; name?: string }
+    > = []
+
+    if (text.trim() !== '') {
+      content.push({ type: 'text', text })
+    }
+
+    if (images && images.length > 0) {
+      for (const img of images) {
+        const cleanBase64 = img.data.includes(',') ? img.data.split(',')[1]! : img.data
+        content.push({
+          type: 'image',
+          mediaType: img.mediaType,
+          data: cleanBase64,
+          ...(img.name ? { name: img.name } : {}),
+        })
+      }
+    }
+
+    if (content.length === 0) {
+      content.push({ type: 'text', text: '' })
+    }
+
     await this.call('session.prompt', {
       sessionId: taskId,
       mode: 'queue',
-      content: [{ type: 'text', text }],
+      content,
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     })
+  }
+
+  async getAttachment(taskId: string, attachmentId: string): Promise<{ attachment: ImageAttachmentRef; data: string }> {
+    const value = sessionAttachmentValueSchema.parse(
+      await this.call('session.attachment', { sessionId: taskId, attachmentId }),
+    )
+    return value
   }
 
   async setTaskPermission(taskId: string, mode: TaskPermissionMode): Promise<void> {
@@ -326,6 +391,14 @@ export class DshHttpAdapter implements DshAdapter {
     let stopped = false
     const sockets = new Set<WebSocketLike>()
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let isInitial = true
+    let currentState: 'connecting' | 'connected' | 'disconnected' | undefined
+
+    const notifyState = (next: 'connecting' | 'connected' | 'disconnected'): void => {
+      if (currentState === next) return
+      currentState = next
+      subscription.onConnectionChange?.(next)
+    }
 
     const cleanupSockets = (): void => {
       for (const socket of sockets) {
@@ -341,14 +414,17 @@ export class DshHttpAdapter implements DshAdapter {
     const connect = (): void => {
       if (stopped) return
       cleanupSockets()
-      subscription.onConnectionChange?.('connecting')
+      if (isInitial) {
+        notifyState('connecting')
+      }
       let opened = 0
       let reconnectScheduled = false
 
       const scheduleReconnect = (): void => {
         if (stopped || reconnectScheduled) return
         reconnectScheduled = true
-        subscription.onConnectionChange?.('disconnected')
+        isInitial = false
+        notifyState('disconnected')
         if (reconnectTimer !== undefined) clearTimeout(reconnectTimer)
         reconnectTimer = setTimeout(connect, 500)
       }
@@ -360,7 +436,10 @@ export class DshHttpAdapter implements DshAdapter {
         sockets.add(socket)
         socket.addEventListener('open', () => {
           opened += 1
-          if (opened === 2) subscription.onConnectionChange?.('connected')
+          if (opened === 2) {
+            isInitial = false
+            notifyState('connected')
+          }
         })
         socket.addEventListener('message', (rawEvent) => {
           const message = rawEvent as MessageEvent
@@ -418,8 +497,10 @@ function createRpcId(): string {
 }
 
 function toTaskSession(session: z.infer<typeof sessionSummarySchema>): TaskSession {
+  const title = session.projections?.values.title
   return {
     id: session.sessionId,
+    ...(title === undefined || title === null ? {} : { title }),
     ...(session.cwd === undefined ? {} : { workspacePath: session.cwd }),
     running: session.running,
     blank: session.blank,

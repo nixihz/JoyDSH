@@ -236,4 +236,188 @@ describe('任务事件投影', () => {
     expect(chunk2.status).toBe('running')
     expect(chunk2.output).toBe('Hello World')
   })
+
+  it('完整投影多回合对话流，保留历史用户消息和助手回复', () => {
+    let proj = createTaskProjection('task-1')
+
+    // Turn 1
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 1),
+      data: { text: '重构权限模块' },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('turn/start', 2),
+      data: { turn: 1 },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('assistant/chunk', 3),
+      data: { chunk: { type: 'text-delta', text: '正在重构中...' } },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('turn/end', 4),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })
+
+    // Turn 2
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 5),
+      data: { text: '测试是否通过？' },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('turn/start', 6),
+      data: { turn: 2 },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('assistant/chunk', 7),
+      data: { chunk: { type: 'text-delta', text: '全部测试已通过！' } },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('turn/end', 8),
+      data: { turn: 2, reason: { kind: 'completed' } },
+    })
+
+    expect(proj.messages).toHaveLength(4)
+    expect(proj.messages[0]).toMatchObject({
+      role: 'user',
+      content: '重构权限模块',
+      isSystemInjection: false,
+    })
+    expect(proj.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: '正在重构中...',
+      status: 'completed',
+    })
+    expect(proj.messages[2]).toMatchObject({
+      role: 'user',
+      content: '测试是否通过？',
+      isSystemInjection: false,
+    })
+    expect(proj.messages[3]).toMatchObject({
+      role: 'assistant',
+      content: '全部测试已通过！',
+      status: 'completed',
+    })
+    // Backwards-compatible current output
+    expect(proj.output).toBe('全部测试已通过！')
+  })
+
+  it('识别系统注入提示并标记 isSystemInjection', () => {
+    let proj = createTaskProjection('task-1')
+
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 1),
+      data: { text: '<system-reminder>\nAvailable skills: ...' },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 2),
+      data: { text: '/permission danger:full-access' },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 3),
+      data: { text: '真实用户需求' },
+    })
+
+    expect(proj.messages).toHaveLength(3)
+    expect(proj.messages[0]?.isSystemInjection).toBe(true)
+    expect(proj.messages[0]?.role).toBe('system')
+    expect(proj.messages[1]?.isCommand).toBe(true)
+    expect(proj.messages[1]?.role).toBe('user')
+    expect(proj.messages[2]?.isSystemInjection).toBe(false)
+    expect(proj.messages[2]?.role).toBe('user')
+  })
+
+  it('解析用户与助手消息中的图片附件', () => {
+    let proj = createTaskProjection('task-1')
+
+    // 用户发送带图片的消息
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 1),
+      data: {
+        content: [
+          { type: 'text', text: '请查看架构图' },
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'att-user-1',
+              mediaType: 'image/png',
+              bytes: 2048,
+              width: 1024,
+              height: 768,
+              name: 'architecture.png',
+            },
+          },
+        ],
+      },
+    })
+
+    // 助手返回带图片的消息
+    proj = projectTaskEvent(proj, {
+      ...event('assistant/message', 2),
+      data: {
+        message: {
+          content: [
+            { type: 'text', text: '已生成预览：' },
+            {
+              type: 'image',
+              attachment: {
+                attachmentId: 'att-ai-1',
+                mediaType: 'image/webp',
+                bytes: 4096,
+                width: 1200,
+                height: 800,
+                name: 'preview.webp',
+              },
+            },
+          ],
+        },
+      },
+    })
+
+    expect(proj.messages).toHaveLength(2)
+    expect(proj.messages[0]).toMatchObject({
+      role: 'user',
+      content: '请查看架构图',
+      images: [
+        {
+          id: 'att-user-1',
+          attachmentId: 'att-user-1',
+          mediaType: 'image/png',
+          bytes: 2048,
+          width: 1024,
+          height: 768,
+          name: 'architecture.png',
+        },
+      ],
+    })
+    expect(proj.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: '已生成预览：',
+      images: [
+        {
+          id: 'att-ai-1',
+          attachmentId: 'att-ai-1',
+          mediaType: 'image/webp',
+          bytes: 4096,
+          width: 1200,
+          height: 800,
+          name: 'preview.webp',
+        },
+      ],
+    })
+  })
+
+  it('为内联图片生成可重复的事件级标识', () => {
+    const imageEvent = {
+      ...event('user/message', 1),
+      data: {
+        content: [{ type: 'image', mediaType: 'image/png', data: 'aW1hZ2U=' }],
+      },
+    }
+
+    const first = projectTaskEvent(createTaskProjection('task-1'), imageEvent)
+    const second = projectTaskEvent(createTaskProjection('task-1'), imageEvent)
+
+    expect(first.messages[0]?.images?.[0]?.id).toBe(`${imageEvent.id}:image-0`)
+    expect(second.messages[0]?.images?.[0]?.id).toBe(first.messages[0]?.images?.[0]?.id)
+  })
 })

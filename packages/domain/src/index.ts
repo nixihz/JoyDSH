@@ -8,6 +8,7 @@ export interface RuntimeHealth {
 
 export interface TaskSession {
   id: string
+  title?: string
   workspacePath?: string
   running: boolean
   blank: boolean
@@ -36,6 +37,41 @@ export interface TaskEvent {
   sequence?: number
   time: number
   data: unknown
+}
+
+export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+
+export interface ImageAttachmentInput {
+  id: string
+  mediaType: ImageMediaType
+  /** Base64 encoded image data (raw or data URL) */
+  data: string
+  name?: string | undefined
+  size?: number | undefined
+}
+
+export interface ImageAttachmentRef {
+  attachmentId: string
+  mediaType: ImageMediaType
+  bytes: number
+  width: number
+  height: number
+  name?: string | undefined
+  originalDimensions?: {
+    width: number
+    height: number
+  } | undefined
+}
+
+export interface MessageImageItem {
+  id: string
+  attachmentId?: string | undefined
+  dataUrl?: string | undefined
+  mediaType?: ImageMediaType | undefined
+  name?: string | undefined
+  width?: number | undefined
+  height?: number | undefined
+  bytes?: number | undefined
 }
 
 /** A task-scoped, opaque boundary token understood by the workspace provider. */
