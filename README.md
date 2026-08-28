@@ -1,17 +1,21 @@
-# JoyDSH
+<h1 align="center">JoyDSH</h1>
 
-JoyDSH 是一款以 DeepSeek Harness 为智能体运行时、以手柄为主要导航设备的本地开发工作空间。它借鉴主机系统界面的空间导航、焦点反馈和快速控制方式，让用户在保留键盘长文本输入效率的同时，显著减少对鼠标的依赖。
+<p align="center">
+  <a href="docs/README.zh-CN.md">简体中文</a>
+</p>
 
-当前项目已完成阶段零至阶段三的完整开发与收口，全流程支持手柄优先、键盘友好的开发闭环（工作空间管理、任务会话、流式执行与结构化计划、双权限预设、TV 审批流、逐文件成果评审、原子安全回滚与智能体精准提交）。详细文档见：
+JoyDSH is a gamepad-driven, TV-style local developer workspace powered by the DeepSeek Harness (DSH) runtime. Inspired by console operating systems' spatial navigation, focus feedback, and fast controls, JoyDSH enables developer workflows with minimal mouse reliance while preserving keyboard efficiency for long-form text and coding.
 
-- [用户操作与按键指南](./docs/user-guide.md)
-- [产品与技术方案](./docs/JoyDSH-产品与技术方案.md)
-- [领域语境](./CONTEXT.md)
-- [架构决策](./docs/adr/)
+The project currently features a complete implementation across phases 0 to 3, delivering a gamepad-first, keyboard-friendly development loop (workspace management, task sessions, streaming execution and structured plan view, dual permission presets, TV-style approval flows, per-file change review, atomic safe rollbacks, and agent-driven commit bridging). Detailed documentation:
 
-首版目标是完成一条真实闭环：选择工作空间、创建或恢复任务、观察智能体执行、处理审批、检查文件变更与成果，并结束或继续任务。
+- [User Operations and Keybindings Guide](./docs/user-guide.md)
+- [Product & Technical Design (Chinese)](./docs/JoyDSH-产品与技术方案.md)
+- [Domain Context](./CONTEXT.md)
+- [Architecture Decision Records (ADRs)](./docs/adr/)
 
-## 开发与构建
+The primary goal is a complete real-world loop: select workspace, create or resume tasks, monitor agent execution, handle interactive tool approvals, inspect file diffs and artifacts, and commit or safely roll back changes.
+
+## Development & Build
 
 - Node.js `22.22.3`
 - pnpm `10.20.0`
@@ -19,42 +23,42 @@ JoyDSH 是一款以 DeepSeek Harness 为智能体运行时、以手柄为主要�
 - DeepSeek Harness `0.1.1-rc.2`
 - Tauri CLI `2.11.4`
 
-安装依赖并启动桌面开发应用：
+Install dependencies and start the desktop app in development mode:
 
 ```bash
 pnpm install
 pnpm dev
 ```
 
-构建原生桌面安装包（macOS `.dmg`/`.app` 或 Windows `.msi`）：
+Build the native desktop installer (macOS `.dmg`/`.app` or Windows `.msi`):
 
 ```bash
 pnpm build:app
 ```
 
-只启动浏览器前端用于布局调试：
+Start the web frontend only for UI layout debugging:
 
 ```bash
 pnpm dev:web
 ```
 
-运行时只监听 `127.0.0.1:43127`，使用应用专属 `DSH_HOME`。在“项目中心”选择工作区根目录后，可输入项目名创建文件夹，或使用系统目录选择器打开已有项目。也可用 `JOYDSH_DSH_BIN` 显式指定固定版本的 DSH 可执行文件。
+The runtime binds strictly to `127.0.0.1:43127` and uses an application-dedicated `DSH_HOME`. In the "Project Hub", select a workspace root to create folders or open existing projects via native system dialogs. You can also explicitly specify a fixed DSH binary path using `JOYDSH_DSH_BIN`.
 
-## 键盘与手柄导航
+## Keyboard & Gamepad Navigation
 
-- **方向键 / 十字键 (D-Pad) / 左摇杆**：按受控焦点图移动，长按支持连发滚动。
-- **`Enter` / 空格 / 手柄南侧按键 (✕ / A)**：确认当前选中的项目或操作。
-- **`Escape` / 手柄东侧按键 (◯ / B)**：退出文字输入、关闭临时弹窗并稳定恢复焦点。
-- **`Tab` / `Shift+Tab` / 左右肩键 (L1/R1, LB/RB)**：快速切换侧边栏、主工作区、检查器焦点区域。
-- **左右扳机 (L2/R2, LT/RT)**：在任务检查器的【动态】【变更】【成果】页面间切换。
-- **西侧按键 (▢ / X) / 北侧按键 (△ / Y)**：在成果检查器中一键【接受变更】或进入【拒绝确认】。
-- **`Cmd/Ctrl+K` / 手柄菜单键 (Options/Menu)**：唤起全局命令中心，支持快速选择项目、回滚任务、智能体提交、停止任务或打开模型设置。
-- **`Cmd/Ctrl+Shift+V` / `F5` / 手柄 Select 键 (Share/View)**：自动聚焦任务输入框并模拟触发语音输入（如 Spokenly / 系统听写，默认模拟右侧 Command 键）。
-- **右摇杆**：平滑滚动执行流日志、差异对比与长内容。
+- **D-Pad / Left Stick / Arrow Keys**: Navigate the spatial focus graph with repeat-scroll on hold.
+- **`Enter` / Space / South Button (✕ / A)**: Confirm current selection or trigger actions.
+- **`Escape` / East Button (◯ / B)**: Exit text input, dismiss modals, and reliably restore focus.
+- **`Tab` / `Shift+Tab` / Bumpers (L1/R1, LB/RB)**: Cycle between sidebar, main workspace, and inspector focus regions.
+- **Triggers (L2/R2, LT/RT)**: Switch between task inspector tabs: [Live Stream], [Changes], [Artifacts].
+- **West Button (▢ / X) / North Button (△ / Y)**: Quick [Accept Changes] or trigger [Reject Confirmation] in the artifact inspector.
+- **`Cmd/Ctrl+K` / Menu Button (Options/Menu)**: Open the global Command Palette for fast project switching, task rollbacks, agent commits, stopping tasks, or model settings.
+- **`Cmd/Ctrl+Shift+V` / `F5` / Select Button (Share/View)**: Automatically focus task input and simulate voice dictation activation (e.g. Spokenly / system dictation, simulating Right Command by default).
+- **Right Stick**: Smoothly scroll streaming execution logs, diff comparisons, and long text views.
 
-长文本与代码输入直接使用实体键盘或语音输入法。输入框聚焦时，方向键保留给文字光标；按 `Escape` 或东侧键退出编辑后即刻恢复空间导航。
+Direct keyboard and voice input are used for text and code editing. When an input field is focused, arrow keys control text cursors; pressing `Escape` or the East button immediately restores spatial navigation.
 
-## 验证
+## Verification
 
 ```bash
 pnpm test
@@ -64,4 +68,4 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
-全仓自动化测试覆盖 164 项 Rust 单元/集成测试（包含任务基线、差异计算、强快照保护、原子安全回滚与提交桥接）与 60 项前端 Vitest 测试。
+Full automated test suite covers 164 Rust unit/integration tests (task baseline, diff computation, strong snapshot protection, atomic safe rollback, and commit bridging) and 60 frontend Vitest tests.
