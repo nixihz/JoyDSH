@@ -104,6 +104,23 @@ describe('语义输入', () => {
     expect(mapper.update(idle, 200)).toEqual([])
   })
 
+  it('允许将语音输入改绑到其他手柄按键并覆盖其默认动作', () => {
+    const mapper = createGamepadMapper({ voiceInputButtonIndex: 11 })
+    const idle = { buttons: Array.from({ length: 16 }, () => false), axes: [0, 0, 0, 0] }
+    const rightStickPressed = {
+      ...idle,
+      buttons: idle.buttons.map((_, index) => index === 11),
+    }
+    const selectPressed = {
+      ...idle,
+      buttons: idle.buttons.map((_, index) => index === 8),
+    }
+
+    expect(mapper.update(rightStickPressed, 10)).toEqual(['voice-input'])
+    expect(mapper.update(idle, 20)).toEqual(['voice-input-release'])
+    expect(mapper.update(selectPressed, 30)).toEqual([])
+  })
+
   it('支持项目与会话切换及新建快捷键与手柄肩键映射', () => {
     expect(mapKeyboardAction({ key: '[', textEntry: false })).toBe('previous-project')
     expect(mapKeyboardAction({ key: ']', textEntry: false })).toBe('next-project')

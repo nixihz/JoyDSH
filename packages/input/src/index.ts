@@ -87,6 +87,7 @@ export interface GamepadMapperOptions {
   initialRepeatDelayMs?: number
   repeatIntervalMs?: number
   menuLongPressMs?: number
+  voiceInputButtonIndex?: number
 }
 
 const REPEATABLE_ACTIONS = new Set<SemanticAction>([
@@ -102,7 +103,6 @@ const BUTTON_ACTIONS: ReadonlyArray<readonly [number, SemanticAction]> = [
   [5, 'next-project'],
   [6, 'previous-page'],
   [7, 'next-page'],
-  [8, 'voice-input'],
   [12, 'move-up'],
   [13, 'move-down'],
   [14, 'move-left'],
@@ -114,13 +114,14 @@ export function createGamepadMapper(options: GamepadMapperOptions = {}): Gamepad
   const initialDelay = options.initialRepeatDelayMs ?? 320
   const repeatInterval = options.repeatIntervalMs ?? 120
   const menuLongPressMs = options.menuLongPressMs ?? 700
+  const voiceInputButtonIndex = options.voiceInputButtonIndex ?? 8
   const held = new Map<SemanticAction, { pressedAt: number, lastEmittedAt: number }>()
   let menuPressedAt: number | undefined
   let menuLongPressEmitted = false
 
   return {
     update(snapshot, now) {
-      const active = activeGamepadActions(snapshot, threshold)
+      const active = activeGamepadActions(snapshot, threshold, voiceInputButtonIndex)
       const emitted: SemanticAction[] = []
       const menuPressed = snapshot.buttons[9] === true
 
@@ -171,11 +172,17 @@ export function createGamepadMapper(options: GamepadMapperOptions = {}): Gamepad
   }
 }
 
-function activeGamepadActions(snapshot: GamepadSnapshot, threshold: number): SemanticAction[] {
+function activeGamepadActions(
+  snapshot: GamepadSnapshot,
+  threshold: number,
+  voiceInputButtonIndex: number,
+): SemanticAction[] {
   const actions: SemanticAction[] = []
   for (const [index, action] of BUTTON_ACTIONS) {
+    if (index === voiceInputButtonIndex) continue
     if (snapshot.buttons[index] === true && !actions.includes(action)) actions.push(action)
   }
+  if (snapshot.buttons[voiceInputButtonIndex] === true) actions.push('voice-input')
   const horizontal = snapshot.axes[0] ?? 0
   const vertical = snapshot.axes[1] ?? 0
   const scrollVertical = snapshot.axes[3] ?? 0

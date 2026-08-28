@@ -39,6 +39,7 @@ describe('voice-input-service', () => {
     expect(config).toEqual(DEFAULT_VOICE_INPUT_CONFIG)
     expect(config.targetKey).toBe('right-command')
     expect(config.mode).toBe('toggle')
+    expect(config.gamepadButton).toBe(8)
     expect(config.enabled).toBe(true)
   })
 
@@ -47,10 +48,26 @@ describe('voice-input-service', () => {
       enabled: true,
       targetKey: 'right-option',
       mode: 'push-to-talk',
+      gamepadButton: 11,
       customKeyCode: 61,
     }
     saveVoiceInputConfig(updated)
     expect(loadVoiceInputConfig()).toEqual(updated)
+  })
+
+  it('为旧配置补充默认手柄触发键', () => {
+    storage['joydsh:voice-input-config'] = JSON.stringify({
+      enabled: true,
+      targetKey: 'function',
+      mode: 'toggle',
+    })
+
+    expect(loadVoiceInputConfig()).toEqual({
+      enabled: true,
+      targetKey: 'function',
+      mode: 'toggle',
+      gamepadButton: 8,
+    })
   })
 
   it('正确映射虚拟按键目标格式', () => {

@@ -13,10 +13,13 @@ export type VoiceInputTargetKey =
 
 export type VoiceInputMode = 'toggle' | 'push-to-talk'
 
+export type VoiceInputGamepadButton = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 11
+
 export interface VoiceInputConfig {
   enabled: boolean
   targetKey: VoiceInputTargetKey
   mode: VoiceInputMode
+  gamepadButton: VoiceInputGamepadButton
   customKeyCode?: number
 }
 
@@ -34,7 +37,24 @@ export const DEFAULT_VOICE_INPUT_CONFIG: VoiceInputConfig = {
   enabled: true,
   targetKey: 'right-command',
   mode: 'toggle',
+  gamepadButton: 8,
 }
+
+export const GAMEPAD_BUTTON_OPTIONS: ReadonlyArray<{ index: VoiceInputGamepadButton, label: string }> = [
+  { index: 8, label: 'Select / Share / View' },
+  { index: 10, label: '左摇杆按下 (L3)' },
+  { index: 11, label: '右摇杆按下 (R3)' },
+  { index: 6, label: '左扳机 (L2 / LT)' },
+  { index: 7, label: '右扳机 (R2 / RT)' },
+  { index: 4, label: '左肩键 (L1 / LB)' },
+  { index: 5, label: '右肩键 (R1 / RB)' },
+  { index: 0, label: '南侧键 (X / A)' },
+  { index: 1, label: '东侧键 (圆圈 / B)' },
+  { index: 2, label: '西侧键 (方块 / X)' },
+  { index: 3, label: '北侧键 (三角 / Y)' },
+]
+
+const GAMEPAD_BUTTONS = new Set<number>(GAMEPAD_BUTTON_OPTIONS.map(option => option.index))
 
 export const TARGET_KEY_OPTIONS: ReadonlyArray<{ key: VoiceInputTargetKey, label: string, description: string }> = [
   { key: 'right-command', label: 'Right Command (右 Cmd)', description: 'Spokenly / Superwhisper 推荐' },
@@ -59,6 +79,9 @@ export function loadVoiceInputConfig(): VoiceInputConfig {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_VOICE_INPUT_CONFIG.enabled,
       targetKey: parsed.targetKey ?? DEFAULT_VOICE_INPUT_CONFIG.targetKey,
       mode: parsed.mode === 'push-to-talk' ? 'push-to-talk' : 'toggle',
+      gamepadButton: GAMEPAD_BUTTONS.has(parsed.gamepadButton as number)
+        ? parsed.gamepadButton as VoiceInputGamepadButton
+        : DEFAULT_VOICE_INPUT_CONFIG.gamepadButton,
       ...(typeof parsed.customKeyCode === 'number' ? { customKeyCode: parsed.customKeyCode } : {}),
     }
     return config
