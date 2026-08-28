@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "JoyDSH",
+  "version": "0.0.0",
+  "identifier": "com.joydsh.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "JoyDSH",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 760,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Gamepad-First Agent Workspace",
+    "longDescription": "JoyDSH is a gamepad-first, keyboard-friendly local developer agent workspace powered by DeepSeek Harness.",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  }
+}
+
