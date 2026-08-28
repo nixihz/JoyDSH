@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+coverage/
+.DS_Store
+*.log
+.scratch/**/artifacts/
+apps/desktop/src-tauri/gen/
+

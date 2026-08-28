@@ -1,0 +1,23 @@
+{
+  "name": "joydsh",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.20.0",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "build:app": "pnpm --filter @joydsh/desktop build:app",
+    "dev": "pnpm --filter @joydsh/desktop tauri dev",
+    "dev:web": "pnpm --filter @joydsh/desktop dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.1.1-rc.2",
+    "@tauri-apps/cli": "2.11.4",
+    "@types/node": "22.15.30",
+    "typescript": "5.8.3",
+    "vitest": "3.2.4"
+  }
+}
+
