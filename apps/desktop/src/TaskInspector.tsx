@@ -23,6 +23,7 @@ export interface TaskInspectorProps {
   onSelectChange: (changeId: string) => void
   onAcceptChange: (changeId: string) => void
   onRequestRejectChange: (changeId: string) => void
+  onEstablishBaseline?: () => void
 }
 
 const INSPECTOR_PAGES: readonly { page: InspectorPage; label: string }[] = [
@@ -51,6 +52,7 @@ export function TaskInspector({
   onSelectChange,
   onAcceptChange,
   onRequestRejectChange,
+  onEstablishBaseline,
 }: TaskInspectorProps) {
   const changes = snapshot?.changes ?? []
   const activityItems = useMemo(() => aggregateActivityItems(events), [events])
@@ -91,9 +93,14 @@ export function TaskInspector({
           onSelectChange={onSelectChange}
           onAcceptChange={onAcceptChange}
           onRequestRejectChange={onRequestRejectChange}
+          {...(onEstablishBaseline === undefined ? {} : { onEstablishBaseline })}
         />
       ) : (
-        <ArtifactsPage snapshot={snapshot} loading={loading} />
+        <ArtifactsPage
+          snapshot={snapshot}
+          loading={loading}
+          {...(onEstablishBaseline === undefined ? {} : { onEstablishBaseline })}
+        />
       )}
     </section>
   )
@@ -151,6 +158,7 @@ function ActivityPage({ items }: { items: readonly ActivityItem[] }) {
 interface SnapshotPageProps {
   snapshot: TaskArtifactSnapshot | undefined
   loading: boolean
+  onEstablishBaseline?: () => void
 }
 
 interface ChangesPageProps extends SnapshotPageProps {
@@ -173,11 +181,30 @@ function ChangesPage({
   onSelectChange,
   onAcceptChange,
   onRequestRejectChange,
+  onEstablishBaseline,
 }: ChangesPageProps) {
   if (loading) return <InspectorState page="changes" message="正在检查任务变更..." />
   if (snapshot === undefined) return <InspectorState page="changes" message="任务开始后可查看文件变更" />
   if (snapshot.availability === 'unavailable') {
-    return <InspectorState page="changes" title={artifactReasonLabel(snapshot.reason)} message={snapshot.message} tone="warning" />
+    const action = (snapshot.reason === 'baseline-missing' || snapshot.reason === 'invalid-baseline') && onEstablishBaseline !== undefined ? (
+      <button
+        type="button"
+        className="inspector-state-btn"
+        data-focus-id="artifact-establish-baseline-changes"
+        onClick={onEstablishBaseline}
+      >
+        建立任务基线
+      </button>
+    ) : undefined
+    return (
+      <InspectorState
+        page="changes"
+        title={artifactReasonLabel(snapshot.reason)}
+        message={snapshot.message}
+        tone="warning"
+        {...(action === undefined ? {} : { action })}
+      />
+    )
   }
   if (snapshot.clean || snapshot.changes.length === 0) {
     return <InspectorState page="changes" title="工作区没有变更" message="当前内容与任务开始时一致" />
@@ -343,11 +370,29 @@ function DiffTotals({ diff }: { diff: FileDiff }) {
   )
 }
 
-function ArtifactsPage({ snapshot, loading }: SnapshotPageProps) {
+function ArtifactsPage({ snapshot, loading, onEstablishBaseline }: SnapshotPageProps) {
   if (loading) return <InspectorState page="artifacts" message="正在汇总任务成果..." />
   if (snapshot === undefined) return <InspectorState page="artifacts" message="任务开始后可查看成果汇总" />
   if (snapshot.availability === 'unavailable') {
-    return <InspectorState page="artifacts" title={artifactReasonLabel(snapshot.reason)} message={snapshot.message} tone="warning" />
+    const action = (snapshot.reason === 'baseline-missing' || snapshot.reason === 'invalid-baseline') && onEstablishBaseline !== undefined ? (
+      <button
+        type="button"
+        className="inspector-state-btn"
+        data-focus-id="artifact-establish-baseline-artifacts"
+        onClick={onEstablishBaseline}
+      >
+        建立任务基线
+      </button>
+    ) : undefined
+    return (
+      <InspectorState
+        page="artifacts"
+        title={artifactReasonLabel(snapshot.reason)}
+        message={snapshot.message}
+        tone="warning"
+        {...(action === undefined ? {} : { action })}
+      />
+    )
   }
 
   return (
@@ -396,9 +441,10 @@ interface InspectorStateProps {
   title?: string
   message: string
   tone?: 'neutral' | 'warning'
+  action?: React.ReactNode
 }
 
-function InspectorState({ page, title, message, tone = 'neutral' }: InspectorStateProps) {
+function InspectorState({ page, title, message, tone = 'neutral', action }: InspectorStateProps) {
   return (
     <div
       id={`inspector-panel-${page}`}
@@ -408,6 +454,7 @@ function InspectorState({ page, title, message, tone = 'neutral' }: InspectorSta
     >
       {title === undefined ? null : <strong>{title}</strong>}
       <p>{message}</p>
+      {action === undefined ? null : <div className="inspector-state__action">{action}</div>}
     </div>
   )
 }

@@ -286,6 +286,27 @@ pub(crate) fn capture_task_baseline(path: &Path) -> Result<TaskBaseline, Worktre
     })
 }
 
+/// Captures task baseline at current repository HEAD without requiring a clean worktree.
+/// This allows existing/restored tasks or tasks started on active workspaces to establish a baseline.
+pub(crate) fn capture_task_baseline_from_head(path: &Path) -> Result<TaskBaseline, WorktreeError> {
+    let workspace = validate_git_workspace(path)?;
+    let revision = workspace
+        .head_revision
+        .ok_or_else(|| WorktreeError::InvalidRevision("HEAD（仓库尚无提交）".into()))?;
+    let captured_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| WorktreeError::SystemClock(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| WorktreeError::SystemClock("毫秒时间戳超出 u64 范围".into()))?;
+
+    Ok(TaskBaseline {
+        repository_root: workspace.repository_root,
+        revision,
+        captured_at,
+    })
+}
+
 pub(crate) fn inspect_changes_from_task_baseline(
     path: &Path,
     baseline: &TaskBaseline,

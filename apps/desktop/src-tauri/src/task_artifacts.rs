@@ -1,6 +1,6 @@
 use crate::worktree::{
-    capture_task_baseline, inspect_changes_from_task_baseline, validate_git_workspace, FileDiff,
-    FileStatus, TaskBaseline, WorktreeInspection,
+    capture_task_baseline, capture_task_baseline_from_head, inspect_changes_from_task_baseline,
+    validate_git_workspace, FileDiff, FileStatus, TaskBaseline, WorktreeError, WorktreeInspection,
 };
 #[cfg(unix)]
 use crate::worktree_commits::recover_pending_worktree_commits;
@@ -261,8 +261,14 @@ impl TaskArtifactStore {
                 return Ok(baseline);
             }
 
-            let baseline =
-                capture_task_baseline(workspace_path).map_err(|error| error.to_string())?;
+            let baseline = match capture_task_baseline(workspace_path) {
+                Ok(baseline) => baseline,
+                Err(WorktreeError::DirtyTaskBaseline) => {
+                    capture_task_baseline_from_head(workspace_path)
+                        .map_err(|error| error.to_string())?
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             data.baselines.insert(task_id.to_string(), baseline.clone());
             self.save_mutation_locked(&mut data)?;
             Ok(baseline)
@@ -3821,6 +3827,27 @@ mod tests {
             "该任务没有本地成果基线，不能安全计算或回滚变更"
         );
         assert_eq!(store.baseline("older-task").unwrap(), None);
+    }
+
+    #[test]
+    fn ensure_baseline_captures_head_on_dirty_workspace() {
+        let temporary = TestDirectory::new();
+        let repository = temporary.0.join("repository");
+        initialize_repository(&repository);
+        let store = TaskArtifactStore::new(temporary.0.join("task-artifacts.json"));
+
+        // Create dirty files before establishing baseline
+        fs::write(repository.join("tracked.txt"), "modified after initial\n").unwrap();
+        fs::write(repository.join("untracked.txt"), "new file\n").unwrap();
+
+        // ensure_baseline should succeed by binding to HEAD
+        let baseline = store.ensure_baseline("dirty-task", &repository).unwrap();
+        assert_eq!(baseline.repository_root, fs::canonicalize(&repository).unwrap());
+        assert!(!baseline.revision.is_empty());
+
+        // inspect should now work and detect the 2 changes
+        let inspection = store.inspect("dirty-task", &repository).unwrap();
+        assert_eq!(inspection.inspection.changes.len(), 2);
     }
 
     fn initialize_repository(path: &Path) {
