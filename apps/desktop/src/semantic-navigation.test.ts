@@ -167,3 +167,61 @@ describe('右摇杆与语义区域滚动 (scrollVisibleRegion)', () => {
     expect(commandList.scrollTop).toBe(240)
   })
 })
+
+describe('焦点管理辅助函数 (focusManagedElement)', () => {
+  const originalDocument = globalThis.document
+  let domElements: { dataset: Record<string, string>; hasAttribute(name: string): boolean; focus: () => void }[] = []
+  let focusedIndex = -1
+
+  beforeEach(() => {
+    domElements = []
+    focusedIndex = -1
+    globalThis.document = {
+      querySelectorAll: ((selector: string) => {
+        if (selector === '[data-focus-id]') {
+          return domElements
+        }
+        return []
+      }) as unknown as Document['querySelectorAll'],
+    } as unknown as Document
+  })
+
+  afterEach(() => {
+    globalThis.document = originalDocument
+  })
+
+  it('成功聚焦未禁用的目标元素', async () => {
+    const { focusManagedElement } = await import('./semantic-navigation.ts')
+    domElements = [
+      {
+        dataset: { focusId: 'project-tab-0' },
+        hasAttribute: () => false,
+        focus: () => { focusedIndex = 0 },
+      },
+      {
+        dataset: { focusId: 'project-tab-1' },
+        hasAttribute: () => false,
+        focus: () => { focusedIndex = 1 },
+      },
+    ]
+
+    const result = focusManagedElement('project-tab-1')
+    expect(result).toBe(true)
+    expect(focusedIndex).toBe(1)
+  })
+
+  it('跳过被禁用的元素或不存在的元素', async () => {
+    const { focusManagedElement } = await import('./semantic-navigation.ts')
+    domElements = [
+      {
+        dataset: { focusId: 'disabled-button' },
+        hasAttribute: (attr: string) => attr === 'disabled',
+        focus: () => { focusedIndex = 0 },
+      },
+    ]
+
+    expect(focusManagedElement('disabled-button')).toBe(false)
+    expect(focusManagedElement('non-existent')).toBe(false)
+    expect(focusedIndex).toBe(-1)
+  })
+})

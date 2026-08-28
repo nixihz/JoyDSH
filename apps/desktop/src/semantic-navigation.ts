@@ -18,6 +18,7 @@ export interface SemanticNavigationOptions {
   onNewSession?(): void
   onNewProject?(): void
   onVoiceInput?(action: 'tap' | 'press' | 'release'): void
+  voiceInputGamepadButton?: number
 }
 
 const SCROLL_STEP_PX = 240
@@ -51,6 +52,20 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
   }, [options.graph])
 
   useEffect(() => {
+    const resolveActiveElement = (graph: FocusGraph): HTMLElement | null => {
+      let active = document.activeElement
+      let id = managedFocusId(active)
+      if (id !== undefined && graph.nodes.some(node => node.id === id)) {
+        return active instanceof HTMLElement ? active : null
+      }
+      const candidateId = (lastNonTextFocusRef.current !== undefined && graph.nodes.some(node => node.id === lastNonTextFocusRef.current))
+        ? lastNonTextFocusRef.current
+        : graph.entryId
+      focusManagedElement(candidateId)
+      active = document.activeElement
+      return active instanceof HTMLElement ? active : null
+    }
+
     const handleAction = (action: SemanticAction, source: 'gamepad' | 'keyboard' = 'keyboard'): void => {
       const {
         graph,
@@ -62,7 +77,7 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
         onPreviousPage,
         onNextPage,
       } = optionsRef.current
-      const active = document.activeElement
+      const active = resolveActiveElement(graph)
       const textEntry = isTextEntry(active)
       const move = ACTION_MOVES[action]
       if (move !== undefined) {
@@ -80,6 +95,10 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
         }
         const targetId = moveFocus(graph, managedFocusId(active), move)
         focusManagedElement(targetId)
+        if (document.activeElement instanceof HTMLElement && !isTextEntry(document.activeElement)) {
+          const newId = managedFocusId(document.activeElement)
+          if (newId !== undefined) lastNonTextFocusRef.current = newId
+        }
         return
       }
       if (action === 'confirm') {
@@ -99,11 +118,22 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       if (action === 'back') {
         if (textEntry && active instanceof HTMLElement) {
           active.blur()
-          const previousId = lastNonTextFocusRef.current
-          const targetId = previousId !== undefined && graph.nodes.some(node => node.id === previousId)
-            ? previousId
-            : graph.entryId
+          const currentId = managedFocusId(active)
+          const validPrevious = lastNonTextFocusRef.current !== undefined
+            && lastNonTextFocusRef.current !== currentId
+            && graph.nodes.some(node => node.id === lastNonTextFocusRef.current)
+          let targetId: string
+          if (validPrevious && lastNonTextFocusRef.current !== undefined) {
+            targetId = lastNonTextFocusRef.current
+          } else {
+            const nonTextNode = graph.nodes.find(node => node.id !== currentId && !isTextNodeId(node.id))
+            targetId = nonTextNode?.id ?? graph.entryId
+          }
           focusManagedElement(targetId)
+          if (document.activeElement instanceof HTMLElement && !isTextEntry(document.activeElement)) {
+            const newId = managedFocusId(document.activeElement)
+            if (newId !== undefined) lastNonTextFocusRef.current = newId
+          }
           return
         }
         onBack?.()
@@ -115,10 +145,10 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       }
       if (action === 'command-center') onCommandCenter?.()
       if (action === 'pause-task') onPauseTask?.()
-      if (action === 'primary-action' && !textEntry) onPrimaryAction?.()
-      if (action === 'more-actions' && !textEntry) onMoreActions?.()
-      if (action === 'previous-page' && !textEntry) onPreviousPage?.()
-      if (action === 'next-page' && !textEntry) onNextPage?.()
+      if (action === 'primary-action' && (!textEntry || source === 'gamepad')) onPrimaryAction?.()
+      if (action === 'more-actions' && (!textEntry || source === 'gamepad')) onMoreActions?.()
+      if (action === 'previous-page' && (!textEntry || source === 'gamepad')) onPreviousPage?.()
+      if (action === 'next-page' && (!textEntry || source === 'gamepad')) onNextPage?.()
       if (action === 'previous-project' && (!textEntry || source === 'gamepad')) optionsRef.current.onPreviousProject?.()
       if (action === 'next-project' && (!textEntry || source === 'gamepad')) optionsRef.current.onNextProject?.()
       if (action === 'previous-session' && (!textEntry || source === 'gamepad')) optionsRef.current.onPreviousSession?.()
@@ -164,7 +194,24 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       if (id !== undefined && !isTextEntry(event.target)) lastNonTextFocusRef.current = id
     }
 
-    const mapper = createGamepadMapper()
+    const handlePointerDown = (event: MouseEvent | PointerEvent): void => {
+      const target = event.target as Element | null
+      const focusable = target?.closest<HTMLElement>('[data-focus-id]')
+      if (focusable && !focusable.hasAttribute('disabled')) {
+        const id = focusable.dataset.focusId
+        if (id !== undefined) {
+          focusable.focus()
+          if (!isTextEntry(focusable)) {
+            lastNonTextFocusRef.current = id
+          }
+        }
+      }
+    }
+
+    const voiceInputButtonIndex = optionsRef.current.voiceInputGamepadButton
+    const mapper = createGamepadMapper(
+      voiceInputButtonIndex === undefined ? {} : { voiceInputButtonIndex },
+    )
     let frame = 0
     const pollGamepads = (now: number): void => {
       const gamepad = navigator.getGamepads().find(candidate => candidate?.connected === true)
@@ -182,13 +229,15 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
 
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('focusin', handleFocusIn)
+    window.addEventListener('pointerdown', handlePointerDown)
     frame = requestAnimationFrame(pollGamepads)
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('focusin', handleFocusIn)
+      window.removeEventListener('pointerdown', handlePointerDown)
       cancelAnimationFrame(frame)
     }
-  }, [])
+  }, [options.voiceInputGamepadButton])
 }
 
 export function focusManagedElement(id: string): boolean {
@@ -210,6 +259,15 @@ function isTextEntry(target: EventTarget | null): boolean {
   return target instanceof HTMLInputElement
     || target instanceof HTMLTextAreaElement
     || target instanceof HTMLSelectElement
+}
+
+function isTextNodeId(id: string): boolean {
+  return id === 'task-input'
+    || id === 'project-name'
+    || id === 'api-key'
+    || id === 'base-url'
+    || id === 'codex-model'
+    || id === 'commit-message'
 }
 
 export function scrollVisibleRegion(active: Element | null, delta: number): HTMLElement | undefined {

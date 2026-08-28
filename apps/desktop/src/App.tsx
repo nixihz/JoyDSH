@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
+  ImageAttachmentInput,
+  ImageMediaType,
   RuntimeConnectionState,
   TaskArtifactBaseline,
   TaskArtifactSnapshot,
@@ -16,8 +18,11 @@ import {
   projectTaskEvent,
   synchronizeTaskRunning,
   type TaskProjection,
+  type TaskProjectionMessage,
 } from '@joydsh/task-projection'
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   Check,
   Circle,
@@ -27,6 +32,8 @@ import {
   Folder,
   FolderKanban,
   GitCommitHorizontal,
+  Image as ImageIcon,
+  Layers3,
   KeyRound,
   LoaderCircle,
   Maximize,
@@ -39,19 +46,25 @@ import {
   Send,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
+  Terminal,
+  User,
   X,
 } from 'lucide-react'
 import {
   loadVoiceInputConfig,
   saveVoiceInputConfig,
   simulateKeyAction,
+  GAMEPAD_BUTTON_OPTIONS,
   TARGET_KEY_OPTIONS,
   type VoiceInputConfig,
+  type VoiceInputGamepadButton,
   type VoiceInputMode,
   type VoiceInputTargetKey,
 } from './voice-input-service.ts'
 import { createRuntimeAdapter } from './dsh-transport.ts'
 import { createAppFocusGraph } from './app-focus.ts'
+import { createLatestSelection } from './latest-selection.ts'
 import { approvalEvidence } from './approval-evidence.ts'
 import { subscribeFullscreenChange, toggleWindowFullscreen } from './fullscreen-service.ts'
 import {
@@ -77,9 +90,21 @@ import {
   setWorkspaceBase,
   type WorkspaceCatalog,
   type WorkspacePermissionMode,
+  type WorkspaceProject,
 } from './workspace-service.ts'
 import { aggregateActivityItems, TaskInspector, type InspectorPage } from './TaskInspector.tsx'
 import { MarkdownContent } from './MarkdownContent.tsx'
+import { ImageLightbox, type LightboxImage } from './ImageLightbox.tsx'
+import { AttachmentRail } from './AttachmentRail.tsx'
+import { MessageImages } from './MessageImages.tsx'
+import {
+  archiveTask,
+  archivedTasks,
+  loadTaskArchiveState,
+  restoreArchivedTask,
+  saveTaskArchiveState,
+  visibleTasks,
+} from './task-archive-service.ts'
 
 const DSH_VERSION = '0.1.1-rc.2'
 const MAX_VISIBLE_EVENTS = 2000
@@ -118,6 +143,8 @@ export function App() {
   const [workspacePath, setWorkspacePath] = useState('')
   const [taskInput, setTaskInput] = useState('')
   const [allTasks, setAllTasks] = useState<TaskSession[]>([])
+  const [taskArchiveState, setTaskArchiveState] = useState(loadTaskArchiveState)
+  const [archiveViewOpen, setArchiveViewOpen] = useState(false)
   const [projections, setProjections] = useState<Record<string, TaskProjection>>({})
   const [activeTaskId, setActiveTaskId] = useState<string | undefined>()
   const [inspectorPage, setInspectorPage] = useState<InspectorPage>('activity')
@@ -158,6 +185,11 @@ export function App() {
   const [voiceConfig, setVoiceConfig] = useState<VoiceInputConfig>(loadVoiceInputConfig)
   const [isVoiceActive, setIsVoiceActive] = useState(false)
   const [voiceTestStatus, setVoiceTestStatus] = useState<string | undefined>()
+  const [pendingImages, setPendingImages] = useState<ImageAttachmentInput[]>([])
+  const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null)
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const lightboxReturnFocusRef = useRef<HTMLElement | null>(null)
   const settingsReturnFocusRef = useRef('settings-toggle')
   const commandReturnFocusRef = useRef('settings-toggle')
   const projectReturnFocusRef = useRef('settings-toggle')
@@ -166,20 +198,23 @@ export function App() {
   const artifactAttemptRef = useRef(0)
   const commitAttemptRef = useRef(0)
   const previousArtifactStatusRef = useRef<TaskProjection['status'] | undefined>(undefined)
+  const taskSelectionRef = useRef(createLatestSelection())
+  const projectTrackRef = useRef<HTMLDivElement>(null)
+  const sessionTrackRef = useRef<HTMLDivElement>(null)
   const outputSurfaceRef = useRef<HTMLDivElement>(null)
 
   const projects = workspaceCatalog.projects
   const activeProject = projects.find(project => project.path === workspacePath)
   const activeProjectIndex = projects.findIndex(project => project.path === workspacePath)
+  const visibleTaskList = useMemo(() => visibleTasks(allTasks, taskArchiveState), [allTasks, taskArchiveState])
+  const archivedTaskList = useMemo(() => archivedTasks(allTasks, taskArchiveState), [allTasks, taskArchiveState])
   const currentProjectTasks = useMemo(() => {
-    return allTasks.filter(t => t.workspacePath === workspacePath || (!t.workspacePath && !workspacePath))
-  }, [allTasks, workspacePath])
+    return visibleTaskList.filter(t => t.workspacePath === workspacePath || (!t.workspacePath && !workspacePath))
+  }, [visibleTaskList, workspacePath])
   const activeTask = useMemo(() => {
     return currentProjectTasks.find(t => t.id === activeTaskId)
       ?? currentProjectTasks[0]
-      ?? allTasks.find(t => t.id === activeTaskId)
-      ?? allTasks[0]
-  }, [activeTaskId, allTasks, currentProjectTasks])
+  }, [activeTaskId, currentProjectTasks])
   const activeSessionIndex = activeTask ? currentProjectTasks.findIndex(t => t.id === activeTask.id) : 0
   const projection = activeTask ? (projections[activeTask.id] ?? createTaskProjection(activeTask.id)) : undefined
 
@@ -206,6 +241,10 @@ export function App() {
     () => selectedApproval === undefined ? undefined : approvalEvidence(selectedApproval, projection?.events ?? []),
     [projection?.events, selectedApproval],
   )
+  const conversationMessages = useMemo(() => {
+    if (!projection?.messages || projection.messages.length === 0) return []
+    return projection.messages.filter(msg => !msg.isSystemInjection)
+  }, [projection?.messages])
 
   const appendEvent = useCallback((event: TaskEvent) => {
     if (event.taskId !== undefined) {
@@ -222,8 +261,13 @@ export function App() {
         const running = event.type === 'host/session-status' && typeof event.data === 'object' && event.data !== null && 'running' in event.data
           ? (event.data as { running: boolean }).running
           : event.type === 'turn/start' ? true : event.type === 'turn/end' ? false : undefined
-        if (running === undefined) return current
-        return current.map(t => t.id === taskId ? { ...t, running } : t)
+        const title = sessionTitleFromProjectionEvent(event)
+        if (running === undefined && title === undefined) return current
+        return current.map(t => t.id === taskId ? {
+          ...t,
+          ...(running === undefined ? {} : { running }),
+          ...(title === undefined ? {} : { title }),
+        } : t)
       })
     } else {
       setProjections(current => {
@@ -263,7 +307,15 @@ export function App() {
 
     try {
       if (establishBoundary) await ensureTaskArtifactBaseline(task.id, path)
-      const snapshot = await inspectTaskArtifacts(task.id, path)
+      let snapshot = await inspectTaskArtifacts(task.id, path)
+      if (snapshot.availability === 'unavailable' && snapshot.reason === 'baseline-missing') {
+        try {
+          await ensureTaskArtifactBaseline(task.id, path)
+          snapshot = await inspectTaskArtifacts(task.id, path)
+        } catch {
+          // Keep unavailable snapshot if establishment cannot complete
+        }
+      }
       if (artifactAttemptRef.current !== attempt) return
       setArtifactBaseline(snapshot.baseline)
       setArtifactSnapshot(snapshot)
@@ -291,25 +343,38 @@ export function App() {
   }, [])
 
   const restoreTask = useCallback(async (task: TaskSession) => {
+    const selection = taskSelectionRef.current.begin()
     commitAttemptRef.current += 1
     setArtifactCommitFlow(undefined)
     setActiveTaskId(task.id)
-    if (task.workspacePath) {
+    const effectivePath = task.workspacePath || workspacePath
+    if (task.workspacePath && task.workspacePath !== workspacePath) {
       setWorkspacePath(task.workspacePath)
     }
     setArtifactBaseline(undefined)
     setArtifactSnapshot(undefined)
     setSelectedArtifactChangeId(undefined)
+    const targetPermission = resolveWorkspaceProjectPermission(
+      workspaceCatalog.projects,
+      effectivePath,
+      projectPermissionMode,
+    )
+    const initialProj: TaskProjection = {
+      ...createTaskProjection(task.id),
+      permissionMode: targetPermission,
+    }
     const history = await adapter.replayTask(task.id)
     const restored = synchronizeTaskRunning(
-      history.reduce(projectTaskEvent, createTaskProjection(task.id)),
+      history.reduce(projectTaskEvent, initialProj),
       task.running,
     )
     const finalProj = { ...restored, events: restored.events.slice(-MAX_VISIBLE_EVENTS) }
+    if (!taskSelectionRef.current.isCurrent(selection)) return finalProj
     setProjections(current => ({ ...current, [task.id]: finalProj }))
+    setProjectPermissionMode(finalProj.permissionMode)
     await loadTaskArtifacts(task, false)
     return finalProj
-  }, [adapter, loadTaskArtifacts])
+  }, [adapter, loadTaskArtifacts, projectPermissionMode, workspaceCatalog.projects, workspacePath])
 
   const reconnect = useCallback(async (reportError = true): Promise<boolean> => {
     setError(undefined)
@@ -318,7 +383,8 @@ export function App() {
       const [, listed] = await Promise.all([adapter.healthCheck(), adapter.listTasks()])
       setConnection('connected')
       setAllTasks(listed)
-      const current = listed.find(t => t.workspacePath === workspacePath) ?? listed[0]
+      const visible = visibleTasks(listed, taskArchiveState)
+      const current = resolveReconnectionTask(visible, workspacePath)
       if (current !== undefined) await restoreTask(current)
       return true
     } catch (cause) {
@@ -326,16 +392,19 @@ export function App() {
       setError(reportError ? errorMessage(cause) : undefined)
       return false
     }
-  }, [adapter, restoreTask, workspacePath])
+  }, [adapter, restoreTask, taskArchiveState, workspacePath])
+
+  const reconnectRef = useRef(reconnect)
+  reconnectRef.current = reconnect
 
   useEffect(() => {
     const unsubscribe = adapter.subscribe({
       onEvent: appendEvent,
       onConnectionChange: setConnection,
     })
-    void reconnect(false)
+    void reconnectRef.current(false)
     return unsubscribe
-  }, [adapter, appendEvent, reconnect])
+  }, [adapter, appendEvent])
 
   const loadWorkspaceCatalog = useCallback(async () => {
     try {
@@ -365,7 +434,19 @@ export function App() {
     if (outputSurfaceRef.current) {
       outputSurfaceRef.current.scrollTop = outputSurfaceRef.current.scrollHeight
     }
-  }, [projection?.output, projection?.status])
+  }, [projection?.output, projection?.status, projection?.messages])
+
+  useEffect(() => {
+    projectTrackRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+  }, [workspacePath])
+
+  useEffect(() => {
+    sessionTrackRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+  }, [activeTaskId])
 
   const closeSettings = useCallback(() => {
     setSettingsOpen(false)
@@ -408,6 +489,7 @@ export function App() {
     approvalAttemptRef.current += 1
     commitAttemptRef.current += 1
     setCommandCenterOpen(false)
+    setArchiveViewOpen(false)
     setSelectedApprovalId(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
@@ -436,6 +518,7 @@ export function App() {
     commitAttemptRef.current += 1
     setArtifactCommitFlow(undefined)
     setArtifactMutationError(undefined)
+    setCommandCenterOpen(true)
     setSelectedApprovalId(approval.approvalId)
   }, [pendingApprovals])
 
@@ -509,17 +592,20 @@ export function App() {
       : document.activeElement instanceof HTMLElement
         ? document.activeElement.dataset.focusId ?? 'settings-toggle'
         : 'settings-toggle'
+    taskSelectionRef.current.invalidate()
     setCommandCenterOpen(false)
+    setSettingsOpen(false)
     setSelectedApprovalId(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
     commitAttemptRef.current += 1
     setArtifactCommitFlow(undefined)
-    setProjectPermissionMode(projection?.permissionMode ?? 'standard')
+    const currentProject = workspaceCatalog.projects.find(p => p.path === workspacePath)
+    setProjectPermissionMode(currentProject?.permissionMode ?? projection?.permissionMode ?? 'standard')
     setProjectCenterOpen(true)
     setProjectError(undefined)
     void loadWorkspaceCatalog()
-  }, [commandCenterOpen, loadWorkspaceCatalog, projection?.permissionMode])
+  }, [commandCenterOpen, loadWorkspaceCatalog, projection?.permissionMode, workspaceCatalog.projects, workspacePath])
 
   const run = useCallback(async (operation: () => Promise<void>) => {
     setBusy(true)
@@ -533,8 +619,7 @@ export function App() {
     }
   }, [])
 
-  const activateWorkspace = useCallback(async (path: string, permissionMode: TaskPermissionMode) => {
-    setWorkspacePath(path)
+  const ensureRuntimeReady = useCallback(async (path: string) => {
     let runtimeReady = false
     try {
       await adapter.healthCheck()
@@ -558,28 +643,48 @@ export function App() {
       if (!runtimeReady) throw new Error('运行时启动超时')
       setConnection('connected')
     }
+  }, [adapter])
+
+  const activateWorkspace = useCallback(async (path: string, permissionMode: TaskPermissionMode) => {
+    setWorkspacePath(path)
+    setProjectPermissionMode(permissionMode)
+    await ensureRuntimeReady(path)
     const tasks = await adapter.listTasks()
     setAllTasks(tasks)
-    const existing = tasks.find(task => task.workspacePath === path)
+    const visible = visibleTasks(tasks, taskArchiveState)
+    const existing = visible.find(task => task.workspacePath === path)
     let task: TaskSession
     if (existing !== undefined) {
-      await restoreTask(existing)
+      const restored = await restoreTask(existing)
       task = existing
+      if (permissionMode === 'full-access' || restored.permissionMode !== permissionMode) {
+        await adapter.setTaskPermission(task.id, permissionMode)
+        setProjections(current => {
+          const prev = current[task.id] ?? createTaskProjection(task.id)
+          return { ...current, [task.id]: { ...prev, permissionMode } }
+        })
+      }
     } else {
       task = await adapter.createTask({ workspacePath: path })
-      setAllTasks(current => [...current.filter(t => t.id !== task.id), task])
+      setAllTasks(current => [task, ...current.filter(t => t.id !== task.id)])
       setActiveTaskId(task.id)
-      setProjections(current => ({ ...current, [task.id]: createTaskProjection(task.id) }))
+      setProjections(current => ({
+        ...current,
+        [task.id]: { ...createTaskProjection(task.id), permissionMode },
+      }))
       setArtifactBaseline(undefined)
       setArtifactSnapshot(undefined)
       setSelectedArtifactChangeId(undefined)
+      setArtifactCommitFlow(undefined)
       await loadTaskArtifacts(task, true)
+      if (permissionMode === 'full-access') {
+        await adapter.setTaskPermission(task.id, permissionMode)
+      }
     }
-    await adapter.setTaskPermission(task.id, permissionMode)
     setProjectCenterOpen(false)
     setProjectName('')
     restoreManagedFocus('task-input')
-  }, [adapter, loadTaskArtifacts, restoreTask])
+  }, [adapter, ensureRuntimeReady, loadTaskArtifacts, restoreTask, taskArchiveState])
 
   const runProject = useCallback(async (operation: () => Promise<void>) => {
     setProjectBusy(true)
@@ -621,24 +726,52 @@ export function App() {
     await activateWorkspace(selection.path, permissionMode)
   })
 
+  const handleChangeWorkspaceProjectPermission = (path: string, permissionMode: WorkspacePermissionMode) => void runProject(async () => {
+    const selection = await rememberWorkspaceProject(path, permissionMode)
+    setWorkspaceCatalog(selection.catalog)
+    if (path === workspacePath) {
+      setProjectPermissionMode(permissionMode)
+    }
+    const task = activeTask?.workspacePath === path
+      ? activeTask
+      : allTasks.find(candidate => candidate.workspacePath === path)
+    if (task !== undefined) {
+      setProjections(current => {
+        const prev = current[task.id] ?? createTaskProjection(task.id)
+        return { ...current, [task.id]: { ...prev, permissionMode } }
+      })
+      await adapter.setTaskPermission(task.id, permissionMode)
+    }
+  })
+
   const handleSelectProject = useCallback((path: string) => {
+    if (path === workspacePath) return
+    taskSelectionRef.current.invalidate()
+    artifactAttemptRef.current += 1
     setWorkspacePath(path)
+    setActiveTaskId(undefined)
+    setArtifactBaseline(undefined)
+    setArtifactSnapshot(undefined)
+    setSelectedArtifactChangeId(undefined)
+    const projectIndex = workspaceCatalog.projects.findIndex(p => p.path === path)
+    if (projectIndex >= 0) {
+      restoreManagedFocus(`project-tab-${projectIndex}`)
+    }
     const projectTasks = allTasks.filter(t => t.workspacePath === path)
+    const proj = workspaceCatalog.projects.find(p => p.path === path)
+    const mode = proj?.permissionMode ?? projectPermissionMode
+    setProjectPermissionMode(mode)
     if (projectTasks.length > 0) {
       const first = projectTasks[0]
       if (first !== undefined) void restoreTask(first)
-    } else {
-      const proj = workspaceCatalog.projects.find(p => p.path === path)
-      const mode = proj?.permissionMode ?? projectPermissionMode
-      void activateWorkspace(path, mode)
     }
-  }, [activateWorkspace, allTasks, projectPermissionMode, restoreTask, workspaceCatalog.projects])
+  }, [allTasks, projectPermissionMode, restoreTask, workspaceCatalog.projects, workspacePath])
 
   const handlePreviousProject = useCallback(() => {
     const projectList = workspaceCatalog.projects
     if (projectList.length <= 1) return
     const currentIndex = projectList.findIndex(p => p.path === workspacePath)
-    const prevIndex = currentIndex <= 0 ? projectList.length - 1 : currentIndex - 1
+    const prevIndex = cycleProjectIndex(currentIndex, projectList.length, 'previous')
     const target = projectList[prevIndex]
     if (target !== undefined) handleSelectProject(target.path)
   }, [handleSelectProject, workspaceCatalog.projects, workspacePath])
@@ -647,17 +780,27 @@ export function App() {
     const projectList = workspaceCatalog.projects
     if (projectList.length <= 1) return
     const currentIndex = projectList.findIndex(p => p.path === workspacePath)
-    const nextIndex = currentIndex < 0 || currentIndex >= projectList.length - 1 ? 0 : currentIndex + 1
+    const nextIndex = cycleProjectIndex(currentIndex, projectList.length, 'next')
     const target = projectList[nextIndex]
     if (target !== undefined) handleSelectProject(target.path)
   }, [handleSelectProject, workspaceCatalog.projects, workspacePath])
 
   const handleSelectSession = useCallback((taskId: string) => {
-    const task = allTasks.find(t => t.id === taskId)
-    if (task !== undefined) {
-      void restoreTask(task)
+    if (taskId === activeTaskId) return
+    const sessionIndex = currentProjectTasks.findIndex(candidate => candidate.id === taskId)
+    if (sessionIndex >= 0) {
+      restoreManagedFocus(`session-card-${sessionIndex}`)
     }
-  }, [allTasks, restoreTask])
+    const task = currentProjectTasks.find(candidate => candidate.id === taskId)
+    if (task !== undefined) void restoreTask(task)
+  }, [activeTaskId, currentProjectTasks, restoreTask])
+
+  const handleHorizontalWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    const track = event.currentTarget
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX) || track.scrollWidth <= track.clientWidth) return
+    event.preventDefault()
+    track.scrollBy({ left: event.deltaY, behavior: 'smooth' })
+  }, [])
 
   const handlePreviousSession = useCallback(() => {
     if (currentProjectTasks.length <= 1 || activeTask === undefined) return
@@ -675,6 +818,26 @@ export function App() {
     if (target !== undefined) handleSelectSession(target.id)
   }, [activeTask, currentProjectTasks, handleSelectSession])
 
+  const handleArchiveTask = useCallback(() => {
+    if (activeTask === undefined || activeTask.running || pendingApprovals.length > 0) return
+    const nextState = archiveTask(taskArchiveState, activeTask.id)
+    saveTaskArchiveState(nextState)
+    setTaskArchiveState(nextState)
+    const nextTask = currentProjectTasks.find(task => task.id !== activeTask.id)
+    setActiveTaskId(nextTask?.id)
+    closeCommandCenter()
+    if (nextTask !== undefined) void restoreTask(nextTask)
+  }, [activeTask, closeCommandCenter, currentProjectTasks, pendingApprovals.length, restoreTask, taskArchiveState])
+
+  const handleRestoreArchivedTask = useCallback((task: TaskSession) => {
+    const nextState = restoreArchivedTask(taskArchiveState, task.id)
+    saveTaskArchiveState(nextState)
+    setTaskArchiveState(nextState)
+    setArchiveViewOpen(false)
+    setCommandCenterOpen(false)
+    void restoreTask(task)
+  }, [restoreTask, taskArchiveState])
+
   const handleNewSession = useCallback(async () => {
     if (workspacePath.trim() === '') {
       openProjectCenter()
@@ -683,29 +846,52 @@ export function App() {
     setBusy(true)
     setError(undefined)
     try {
+      const proj = workspaceCatalog.projects.find(p => p.path === workspacePath)
+      const targetPermission: TaskPermissionMode = proj?.permissionMode ?? projectPermissionMode ?? 'standard'
       if (connection !== 'connected') {
-        const proj = workspaceCatalog.projects.find(p => p.path === workspacePath)
-        const mode = proj?.permissionMode ?? activePermissionMode
-        await activateWorkspace(workspacePath, mode)
+        await activateWorkspace(workspacePath, targetPermission)
         return
       }
       const task = await adapter.createTask({ workspacePath: workspacePath.trim() })
       setAllTasks(current => [task, ...current])
       setActiveTaskId(task.id)
-      const newProj = createTaskProjection(task.id)
+      const newProj: TaskProjection = {
+        ...createTaskProjection(task.id),
+        permissionMode: targetPermission,
+      }
       setProjections(current => ({ ...current, [task.id]: newProj }))
       setArtifactBaseline(undefined)
       setArtifactSnapshot(undefined)
       setSelectedArtifactChangeId(undefined)
       await loadTaskArtifacts(task, true)
-      await adapter.setTaskPermission(task.id, activePermissionMode)
+      if (targetPermission === 'full-access') {
+        await adapter.setTaskPermission(task.id, targetPermission)
+      }
       restoreManagedFocus('task-input')
     } catch (cause) {
       setError(errorMessage(cause))
     } finally {
       setBusy(false)
     }
-  }, [activateWorkspace, activePermissionMode, adapter, connection, loadTaskArtifacts, openProjectCenter, workspaceCatalog.projects, workspacePath])
+  }, [activateWorkspace, adapter, connection, loadTaskArtifacts, openProjectCenter, projectPermissionMode, workspaceCatalog.projects, workspacePath])
+
+  const handleToggleActiveSessionPermission = useCallback(async () => {
+    if (activeTask === undefined) return
+    const nextMode: TaskPermissionMode = activePermissionMode === 'full-access' ? 'standard' : 'full-access'
+    setProjections(current => {
+      const existing = current[activeTask.id] ?? createTaskProjection(activeTask.id)
+      return {
+        ...current,
+        [activeTask.id]: { ...existing, permissionMode: nextMode },
+      }
+    })
+    setProjectPermissionMode(nextMode)
+    try {
+      await adapter.setTaskPermission(activeTask.id, nextMode)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    }
+  }, [activePermissionMode, activeTask, adapter])
 
   const handleNewProject = useCallback(() => {
     openProjectCenter()
@@ -726,11 +912,137 @@ export function App() {
     throw new Error('运行时启动超时')
   })
 
+  const handleRemoveImage = useCallback((id: string) => {
+    setPendingImages(current => current.filter(img => img.id !== id))
+  }, [])
+
+  const openImageLightbox = useCallback((image: LightboxImage) => {
+    lightboxReturnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    setLightboxImage(image)
+  }, [])
+
+  const closeImageLightbox = useCallback(() => {
+    const returnTarget = lightboxReturnFocusRef.current
+    setLightboxImage(null)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (returnTarget?.isConnected) returnTarget.focus()
+      })
+    })
+  }, [])
+
+  const handlePreviewPendingImage = useCallback((img: ImageAttachmentInput) => {
+    openImageLightbox({
+      src: img.data.startsWith('data:') ? img.data : `data:${img.mediaType};base64,${img.data}`,
+      name: img.name,
+      alt: img.name,
+      bytes: img.size,
+    })
+  }, [openImageLightbox])
+
+  const handleAddImageFiles = useCallback((files: FileList | File[]) => {
+    const validMimes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+    const list = Array.from(files)
+    for (const file of list) {
+      if (!validMimes.has(file.type)) continue
+      const reader = new FileReader()
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          const resultStr = reader.result
+          const id = `att-draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+          setPendingImages(current => [
+            ...current,
+            {
+              id,
+              mediaType: file.type as ImageMediaType,
+              data: resultStr,
+              name: file.name,
+              size: file.size,
+            },
+          ])
+        }
+      }
+      reader.readAsDataURL(file)
+    }
+  }, [])
+
+  const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+      handleAddImageFiles(event.target.files)
+      event.target.value = ''
+    }
+  }, [handleAddImageFiles])
+
+  const handlePaste = useCallback((event: React.ClipboardEvent | ClipboardEvent) => {
+    const items = event.clipboardData?.items
+    if (!items) return
+    const imageFiles: File[] = []
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item && item.type.startsWith('image/')) {
+        const file = item.getAsFile()
+        if (file) imageFiles.push(file)
+      }
+    }
+    if (imageFiles.length > 0) {
+      event.preventDefault()
+      handleAddImageFiles(imageFiles)
+    }
+  }, [handleAddImageFiles])
+
+  const handleDragOver = useCallback((event: React.DragEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.dataTransfer?.types.includes('Files')) {
+      setIsDraggingOver(true)
+    }
+  }, [])
+
+  const handleDragLeave = useCallback((event: React.DragEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.currentTarget.contains(event.relatedTarget as Node)) return
+    setIsDraggingOver(false)
+  }, [])
+
+  const handleDrop = useCallback((event: React.DragEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setIsDraggingOver(false)
+    const files = event.dataTransfer?.files
+    if (files && files.length > 0) {
+      handleAddImageFiles(files)
+    }
+  }, [handleAddImageFiles])
+
   const handleSend = () => void run(async () => {
     if (activeTask === undefined) throw new Error('请先创建任务会话')
     const text = taskInput.trim()
-    if (text === '') return
+    const imagesToSend = [...pendingImages]
+    if (text === '' && imagesToSend.length === 0) return
     const taskId = activeTask.id
+    const now = Date.now()
+    const optimisticMsg: TaskProjectionMessage = {
+      id: `user-input-${now}`,
+      role: 'user',
+      content: text,
+      time: now,
+      isSystemInjection: false,
+      isCommand: text.startsWith('/'),
+      ...(imagesToSend.length > 0
+        ? {
+            images: imagesToSend.map(img => ({
+              id: img.id,
+              dataUrl: img.data.startsWith('data:') ? img.data : `data:${img.mediaType};base64,${img.data}`,
+              mediaType: img.mediaType,
+              name: img.name,
+              bytes: img.size,
+            })),
+          }
+        : {}),
+    }
     setProjections(current => {
       const existing = current[taskId] ?? createTaskProjection(taskId)
       const { failure: _failure, ...clean } = existing
@@ -740,12 +1052,37 @@ export function App() {
           ...clean,
           status: 'running',
           output: '',
+          messages: [...clean.messages, optimisticMsg],
         },
       }
     })
     setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: true } : t))
-    await adapter.sendInput(taskId, text)
     setTaskInput('')
+    setPendingImages([])
+    try {
+      await adapter.sendInput(taskId, text, imagesToSend)
+    } catch (cause) {
+      const message = errorMessage(cause)
+      setTaskInput(current => current === '' ? text : current)
+      setPendingImages(current => current.length === 0 ? imagesToSend : [...imagesToSend, ...current])
+      setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: false } : t))
+      setProjections(current => {
+        const existing = current[taskId]
+        if (existing === undefined) return current
+        return {
+          ...current,
+          [taskId]: {
+            ...existing,
+            status: 'failed',
+            failure: { message },
+            messages: existing.messages.map(candidate => candidate.id === optimisticMsg.id
+              ? { ...candidate, status: 'failed', failure: { message } }
+              : candidate),
+          },
+        }
+      })
+      throw cause
+    }
   })
 
   const handleVoiceInputTrigger = useCallback(async (action: 'tap' | 'press' | 'release' = 'tap') => {
@@ -1063,6 +1400,11 @@ export function App() {
     setArtifactMutationError(undefined)
   }, [])
 
+  const handleEstablishBaseline = useCallback(() => {
+    if (activeTask === undefined) return
+    void loadTaskArtifacts(activeTask, true)
+  }, [activeTask, loadTaskArtifacts])
+
   const moveInspectorPage = useCallback((offset: -1 | 1) => {
     const current = INSPECTOR_PAGES.indexOf(inspectorPage)
     const next = (current + offset + INSPECTOR_PAGES.length) % INSPECTOR_PAGES.length
@@ -1155,10 +1497,13 @@ export function App() {
     hasFailureAction: projection?.failure?.code === 'MISSING_CREDENTIAL',
     busy,
     canPauseTask,
-    canSend: taskInput.trim() !== '' && !busy,
+    canSend: (taskInput.trim() !== '' || pendingImages.length > 0) && !busy,
     settingsOpen,
     commandCenterOpen,
     approvalDetailOpen: selectedApproval !== undefined,
+    archiveViewOpen,
+    archivedTaskCount: archivedTaskList.length,
+    canArchiveTask: activeTask !== undefined && !activeTask.running && !canPauseTask,
     artifactConfirmationOpen: artifactConfirmation !== undefined,
     ...(artifactCommitFlow === undefined ? {} : { commitPhase: artifactCommitFlow.phase }),
     approvalResponding: approvalRespondingId !== undefined,
@@ -1183,13 +1528,16 @@ export function App() {
     canRollbackArtifacts,
     canCommitArtifacts,
     canContinueCommit: artifactCommitFlow?.phase === 'editing' && artifactCommitFlow.message.trim() !== '',
-  }), [activeProjectIndex, activeSessionIndex, activeTask, approvalRespondingId, artifactCommitFlow, artifactConfirmation, artifactSnapshot?.changes, busy, canApplyModel, canCommitArtifacts, canPauseTask, canReviewArtifacts, canRollbackArtifacts, commandCenterOpen, connected, credentialStatus, currentProjectTasks.length, inspectorPage, pendingApprovals.length, projectBusy, projectCenterOpen, projectName, projectPermissionMode, projection?.failure?.code, selectedApproval, selectedArtifactChange?.review, selectedArtifactChangeId, selectedProvider, settingsBusy, settingsOpen, taskInput, workspaceCatalog])
+    lightboxOpen: lightboxImage !== null,
+    pendingAttachmentIds: pendingImages.map(img => img.id),
+  }), [activeProjectIndex, activeSessionIndex, activeTask, approvalRespondingId, archiveViewOpen, archivedTaskList.length, artifactCommitFlow, artifactConfirmation, artifactSnapshot?.changes, busy, canApplyModel, canCommitArtifacts, canPauseTask, canReviewArtifacts, canRollbackArtifacts, commandCenterOpen, connected, credentialStatus, currentProjectTasks.length, inspectorPage, lightboxImage, pendingApprovals.length, pendingImages, projectBusy, projectCenterOpen, projectName, projectPermissionMode, projection?.failure?.code, selectedApproval, selectedArtifactChange?.review, selectedArtifactChangeId, selectedProvider, settingsBusy, settingsOpen, taskInput, workspaceCatalog])
 
   useSemanticNavigation({
     graph: focusGraph,
     onCommandCenter: toggleCommandCenter,
     onPauseTask: handlePauseTask,
     onVoiceInput: handleVoiceInputTrigger,
+    voiceInputGamepadButton: voiceConfig.gamepadButton,
     onPreviousProject: handlePreviousProject,
     onNextProject: handleNextProject,
     onPreviousSession: handlePreviousSession,
@@ -1213,7 +1561,9 @@ export function App() {
           onNextPage: () => moveInspectorPage(1),
         }
       : {}),
-    ...(projectCenterOpen
+    ...(lightboxImage !== null
+      ? { onBack: closeImageLightbox }
+      : projectCenterOpen
       ? { onBack: closeProjectCenter }
       : commandCenterOpen && artifactConfirmation !== undefined
         ? { onBack: closeArtifactConfirmation }
@@ -1231,7 +1581,19 @@ export function App() {
   })
 
   return (
-    <main className="app-shell">
+    <main
+      className="app-shell"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      onPaste={handlePaste}
+    >
+      {isDraggingOver ? (
+        <div className="window-drop-overlay" aria-hidden="true">
+          <ImageIcon aria-hidden="true" className="composer-drop-icon" />
+          <span>松开即可添加图片</span>
+        </div>
+      ) : null}
       <header className="topbar">
         <div className="brand-lockup">
           <strong className="brand">JoyDSH</strong>
@@ -1242,12 +1604,16 @@ export function App() {
         {workspaceCatalog.projects.length > 0 ? (
           <div className="ps5-project-bar" role="tablist" aria-label="项目列表">
             <span className="ps5-bumper-badge" title="按 L1 切换前一个项目"><kbd>L1</kbd></span>
-            <div className="ps5-project-track">
+            <div
+              ref={projectTrackRef}
+              className="ps5-project-track"
+              onWheel={handleHorizontalWheel}
+            >
               {workspaceCatalog.projects.map((project, index) => {
                 const isActive = project.path === workspacePath
-                const pTasks = allTasks.filter(t => t.workspacePath === project.path)
-                const pRunning = pTasks.some(t => t.running || projections[t.id]?.status === 'running')
-                const pApprovals = pTasks.reduce((acc, t) => acc + (projections[t.id]?.pendingApprovals.length ?? 0), 0)
+                const projectTasks = allTasks.filter(task => task.workspacePath === project.path)
+                const projectRunning = projectTasks.some(task => task.running || projections[task.id]?.status === 'running')
+                const projectApprovals = projectTasks.reduce((count, task) => count + (projections[task.id]?.pendingApprovals.length ?? 0), 0)
                 return (
                   <button
                     key={project.path}
@@ -1258,25 +1624,26 @@ export function App() {
                     role="tab"
                     aria-selected={isActive}
                     onClick={() => handleSelectProject(project.path)}
+                    title={project.path}
                   >
                     <Folder className="ps5-project-tab__icon" aria-hidden="true" />
                     <div className="ps5-project-tab__info">
                       <strong>{project.name}</strong>
                     </div>
                     <div className="ps5-project-tab__badge">
-                      {pApprovals > 0 ? (
+                      {projectApprovals > 0 ? (
                         <span className="ps5-pill ps5-pill--warning">
                           <ShieldAlert aria-hidden="true" />
-                          {pApprovals}
+                          {projectApprovals}
                         </span>
-                      ) : pRunning ? (
+                      ) : projectRunning ? (
                         <span className="ps5-pill ps5-pill--running">
                           <span className="ps5-pulse-dot" />
-                          执行中
+                          运行中
                         </span>
                       ) : (
                         <span className="ps5-pill ps5-pill--idle">
-                          {pTasks.length} 会话
+                          {projectTasks.length} 会话
                         </span>
                       )}
                     </div>
@@ -1288,10 +1655,10 @@ export function App() {
                 className="ps5-project-tab ps5-project-tab--new"
                 type="button"
                 onClick={openProjectCenter}
-                title="选择或新建项目"
+                title="管理工作区"
               >
                 <Plus aria-hidden="true" />
-                <span>新建项目</span>
+                <span>管理工作区</span>
               </button>
             </div>
             <span className="ps5-bumper-badge" title="按 R1 切换后一个项目"><kbd>R1</kbd></span>
@@ -1318,67 +1685,108 @@ export function App() {
         </div>
       </header>
 
-      <div className="workspace-grid">
+      <div className={`workspace-grid${workspacePath ? ' workspace-grid--with-sidebar' : ''}`}>
+        {workspacePath ? (
+          <aside className="sessions-sidebar" aria-label="会话列表">
+            <div className="sessions-sidebar__header">
+              <div className="sessions-sidebar__title">
+                <Layers3 className="sessions-sidebar__icon" aria-hidden="true" />
+                <span>会话</span>
+                <span className="sessions-sidebar__count">{currentProjectTasks.length}</span>
+              </div>
+              <button
+                data-focus-id="session-card-new"
+                className="icon-button icon-button--quiet sessions-sidebar__add"
+                type="button"
+                onClick={() => void handleNewSession()}
+                disabled={busy}
+                title="新建任务会话 (快捷键 △)"
+                aria-label="新建任务会话"
+              >
+                <Plus aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="sessions-sidebar__list" role="tablist" aria-label="任务会话" data-scroll-region="sessions-sidebar">
+              {currentProjectTasks.map((task, index) => {
+                const isSessionActive = activeTask?.id === task.id
+                const taskProj = projections[task.id]
+                const taskStatus = taskProj?.status ?? (task.running ? 'running' : 'idle')
+                return (
+                  <button
+                    key={task.id}
+                    id={`session-card-${index}`}
+                    data-focus-id={`session-card-${index}`}
+                    className={`session-card-item${isSessionActive ? ' session-card-item--active' : ''}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSessionActive}
+                    onClick={() => handleSelectSession(task.id)}
+                    title={`${task.title ?? '会话'} · ${task.id} · ${projectionStatusLabel(taskStatus)}`}
+                  >
+                    <span className={`ps5-status-dot ps5-status-dot--${taskStatus}`} />
+                    <div className="session-card-item__content">
+                      <span className="session-card-item__title">{task.title ?? shortId(task.id)}</span>
+                    </div>
+                    {taskProj && taskProj.pendingApprovals.length > 0 ? (
+                      <em className="ps5-chip-badge">{taskProj.pendingApprovals.length}</em>
+                    ) : null}
+                  </button>
+                )
+              })}
+
+              {currentProjectTasks.length === 0 ? (
+                <div className="sessions-sidebar__empty">
+                  <span>暂无会话</span>
+                </div>
+              ) : null}
+            </div>
+          </aside>
+        ) : null}
+
         <section className="task-panel" aria-labelledby="task-heading">
           <div className="panel-heading">
             <div className="panel-heading__title">
               <h1 id="task-heading">{activeProject?.name ?? (activeTask === undefined ? '项目' : '当前任务')}</h1>
-              {activeTask === undefined ? null : <span className="session-id">{shortId(activeTask.id)}</span>}
+              {activeTask === undefined ? null : <span className="session-id">{activeTask.title ?? shortId(activeTask.id)}</span>}
             </div>
-
-            {/* PS5 Session Activity Strip */}
-            {workspacePath ? (
-              <div className="ps5-session-quickbar" role="tablist" aria-label="任务会话">
-                {currentProjectTasks.map((task, index) => {
-                  const isSessionActive = activeTask?.id === task.id
-                  const taskProj = projections[task.id]
-                  const taskStatus = taskProj?.status ?? (task.running ? 'running' : 'idle')
-                  return (
-                    <button
-                      key={task.id}
-                      id={`session-card-${index}`}
-                      data-focus-id={`session-card-${index}`}
-                      className={`ps5-session-chip${isSessionActive ? ' ps5-session-chip--active' : ''}`}
-                      type="button"
-                      role="tab"
-                      aria-selected={isSessionActive}
-                      onClick={() => handleSelectSession(task.id)}
-                      title={`会话 ${shortId(task.id)} · ${projectionStatusLabel(taskStatus)}`}
-                    >
-                      <span className={`ps5-status-dot ps5-status-dot--${taskStatus}`} />
-                      <span>{shortId(task.id)}</span>
-                      {taskProj && taskProj.pendingApprovals.length > 0 ? (
-                        <em className="ps5-chip-badge">{taskProj.pendingApprovals.length}</em>
-                      ) : null}
-                    </button>
-                  )
-                })}
-                <button
-                  data-focus-id="session-card-new"
-                  className="ps5-session-chip ps5-session-chip--new"
-                  type="button"
-                  onClick={() => void handleNewSession()}
-                  disabled={busy}
-                  title="新建任务会话 (快捷键 △)"
-                >
-                  <Plus aria-hidden="true" />
-                  <span>新建会话</span>
-                  <kbd className="glyph-triangle">△</kbd>
-                </button>
-              </div>
-            ) : null}
           </div>
 
           <div className="task-surface">
             {activeTask === undefined ? (
               <div className="empty-state empty-state--action">
-                <span className="step-label">工作空间</span>
-                <h2>选择一个项目</h2>
-                <p>{workspaceCatalog.baseDirectory ?? '尚未设置工作区根目录'}</p>
-                <button data-focus-id="open-project-center" className="button button--primary button--tv" type="button" onClick={openProjectCenter} disabled={busy}>
-                  <FolderKanban aria-hidden="true" />
-                  选择项目
-                </button>
+                <span className="step-label">{activeProject ? '项目工作区' : '工作空间'}</span>
+                <h2>{activeProject ? `${activeProject.name} · 暂无活跃会话` : '选择一个项目'}</h2>
+                <p>{activeProject ? activeProject.path : (workspaceCatalog.baseDirectory ?? '尚未设置工作区根目录')}</p>
+                {activeProject ? (
+                  <div className="empty-state__actions">
+                    <button
+                      data-focus-id="empty-new-session"
+                      className="button button--primary button--tv"
+                      type="button"
+                      onClick={() => void handleNewSession()}
+                      disabled={busy}
+                    >
+                      <Plus aria-hidden="true" />
+                      新建会话 (△)
+                    </button>
+                    <button
+                      data-focus-id="open-project-center"
+                      className="button button--quiet button--tv"
+                      type="button"
+                      onClick={openProjectCenter}
+                      disabled={busy}
+                    >
+                      <FolderKanban aria-hidden="true" />
+                      管理项目
+                    </button>
+                  </div>
+                ) : (
+                  <button data-focus-id="open-project-center" className="button button--primary button--tv" type="button" onClick={openProjectCenter} disabled={busy}>
+                    <FolderKanban aria-hidden="true" />
+                    选择项目
+                  </button>
+                )}
                 {error === undefined ? null : <div className="inline-error" role="alert">{error}</div>}
               </div>
             ) : (
@@ -1389,12 +1797,32 @@ export function App() {
                     <span>任务状态</span>
                     <strong>{projectionStatusLabel(projection?.status)}</strong>
                   </div>
-                  <span className={`permission-badge permission-badge--${activePermissionMode}`}>
+                  <button
+                    data-focus-id="task-permission-toggle"
+                    className={`permission-badge permission-badge--${activePermissionMode} permission-badge--interactive`}
+                    type="button"
+                    onClick={() => void handleToggleActiveSessionPermission()}
+                    title={`当前为${permissionLabel(activePermissionMode)}，点击切换为${activePermissionMode === 'full-access' ? '标准权限（敏感操作需要审批）' : '完全访问（免审批自动执行）'}`}
+                  >
                     <ShieldCheck aria-hidden="true" />
-                    {permissionLabel(activePermissionMode)}
-                  </span>
+                    <span>{permissionLabel(activePermissionMode)}</span>
+                    <small className="permission-badge__hint">点击切换</small>
+                  </button>
                   <span className="event-count">{activityItems.length} 条动态</span>
                 </div>
+                {pendingApprovals.length > 0 ? (
+                  <section className="task-approval-alert" aria-labelledby="task-approval-title" role="status">
+                    <ShieldAlert aria-hidden="true" />
+                    <div>
+                      <span>需要你的审批</span>
+                      <strong id="task-approval-title">{pendingApprovals[0]?.toolName ?? '敏感操作'}</strong>
+                      <p>{pendingApprovals[0]?.reason ?? '该操作需要你的明确许可。'}</p>
+                    </div>
+                    <button data-focus-id="task-approval-open" className="button button--warning" type="button" onClick={openApprovalDetail}>
+                      查看并处理
+                    </button>
+                  </section>
+                ) : null}
                 {projection !== undefined && projection.plan.length > 0 ? (
                   <section className="task-plan" aria-labelledby="task-plan-heading">
                     <header>
@@ -1417,7 +1845,115 @@ export function App() {
                   </section>
                 ) : null}
                 <div className={`output-surface${projection?.failure === undefined ? '' : ' output-surface--error'}`} ref={outputSurfaceRef} data-scroll-region="task-output" aria-live="polite">
-                  {projection?.failure !== undefined ? (
+                  {conversationMessages.length > 0 ? (
+                    <div className="conversation-stream">
+                      {conversationMessages.map((msg, index) => {
+                        if (msg.role === 'user') {
+                          return (
+                            <div key={msg.id || index} className={`chat-message chat-message--user${msg.isCommand ? ' chat-message--command' : ''}`}>
+                              <div className="chat-message__header">
+                                <span className="chat-message__sender">
+                                  <User aria-hidden="true" />
+                                  <span>你</span>
+                                </span>
+                                {msg.time ? <time className="chat-message__time">{formatTime(msg.time)}</time> : null}
+                              </div>
+                              <div className="chat-bubble chat-bubble--user">
+                                {msg.images && msg.images.length > 0 ? (
+                                  <MessageImages
+                                    images={msg.images}
+                                    taskId={activeTask?.id}
+                                    adapter={adapter}
+                                    onPreviewImage={openImageLightbox}
+                                  />
+                                ) : null}
+                                {msg.isCommand ? (
+                                  <div className="chat-command-content">
+                                    <Terminal aria-hidden="true" />
+                                    <code>{msg.content}</code>
+                                  </div>
+                                ) : msg.content ? (
+                                  <p>{msg.content}</p>
+                                ) : null}
+                              </div>
+                            </div>
+                          )
+                        }
+
+                        if (msg.role === 'assistant') {
+                          const isLatest = index === conversationMessages.length - 1
+                          const isStreaming = msg.status === 'streaming' || (isLatest && projection?.status === 'running')
+                          const isFailed = msg.status === 'failed' || (isLatest && projection?.status === 'failed')
+                          const failure = msg.failure ?? (isLatest ? projection?.failure : undefined)
+
+                          return (
+                            <div key={msg.id || index} className={`chat-message chat-message--assistant${isFailed ? ' chat-message--error' : ''}`}>
+                              <div className="chat-message__header">
+                                <span className="chat-message__sender">
+                                  <Sparkles aria-hidden="true" />
+                                  <span>JoyDSH</span>
+                                </span>
+                                {isStreaming ? (
+                                  <span className="chat-message__status chat-message__status--streaming">
+                                    <LoaderCircle aria-hidden="true" className="spin-icon" />
+                                    <span>正在生成...</span>
+                                  </span>
+                                ) : isFailed ? (
+                                  <span className="chat-message__status chat-message__status--error">
+                                    <ShieldAlert aria-hidden="true" />
+                                    <span>执行异常</span>
+                                  </span>
+                                ) : msg.time ? (
+                                  <time className="chat-message__time">{formatTime(msg.time)}</time>
+                                ) : null}
+                              </div>
+                              <div className="chat-bubble chat-bubble--assistant">
+                                {msg.images && msg.images.length > 0 ? (
+                                  <MessageImages
+                                    images={msg.images}
+                                    taskId={activeTask?.id}
+                                    adapter={adapter}
+                                    onPreviewImage={openImageLightbox}
+                                  />
+                                ) : null}
+                                {msg.content ? (
+                                  <MarkdownContent content={msg.content} onPreviewImage={openImageLightbox} />
+                                ) : isStreaming ? (
+                                  <div className="chat-bubble__streaming-placeholder">
+                                    <LoaderCircle aria-hidden="true" className="spin-icon" />
+                                    <span>正在思考并组织回复...</span>
+                                  </div>
+                                ) : null}
+                                {failure !== undefined ? (
+                                  <div className="failure-message failure-message--inline">
+                                    <span>{failure.code ?? 'RUNTIME_ERROR'}</span>
+                                    <h2>{failureTitle(failure.code)}</h2>
+                                    <p>{failureDescription(failure.code, failure.message)}</p>
+                                    {failure.code === 'MISSING_CREDENTIAL' ? (
+                                      <button data-focus-id="failure-model-settings" className="button failure-action" type="button" onClick={openSettings}>
+                                        <KeyRound aria-hidden="true" />
+                                        配置模型
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          )
+                        }
+
+                        // Fallback / System message
+                        return (
+                          <div key={msg.id || index} className="chat-message chat-message--system">
+                            <span className="chat-system-tag">
+                              <Terminal aria-hidden="true" />
+                              <span>{msg.content}</span>
+                            </span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : projection?.failure !== undefined ? (
                     <div className="failure-message">
                       <span>{projection.failure.code ?? 'RUNTIME_ERROR'}</span>
                       <h2>{failureTitle(projection.failure.code)}</h2>
@@ -1430,9 +1966,24 @@ export function App() {
                       ) : null}
                     </div>
                   ) : projection?.output ? (
-                    <div className="assistant-output">
-                      <span>JoyDSH{projection.status === 'running' ? ' · 正在生成...' : ''}</span>
-                      <MarkdownContent content={projection.output} />
+                    <div className="conversation-stream">
+                      <div className="chat-message chat-message--assistant">
+                        <div className="chat-message__header">
+                          <span className="chat-message__sender">
+                            <Sparkles aria-hidden="true" />
+                            <span>JoyDSH</span>
+                          </span>
+                          {projection.status === 'running' ? (
+                            <span className="chat-message__status chat-message__status--streaming">
+                              <LoaderCircle aria-hidden="true" className="spin-icon" />
+                              <span>正在生成...</span>
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="chat-bubble chat-bubble--assistant">
+                          <MarkdownContent content={projection.output} onPreviewImage={openImageLightbox} />
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     <div className="output-placeholder">
@@ -1444,21 +1995,39 @@ export function App() {
                     </div>
                   )}
                 </div>
-                <form className="composer" onSubmit={(event) => { event.preventDefault(); handleSend() }}>
+                <form
+                  className={`composer ${isDraggingOver ? 'composer--dragover' : ''}`}
+                  onSubmit={(event) => { event.preventDefault(); handleSend() }}
+                >
                   <label htmlFor="task-input">告诉 JoyDSH 要完成什么</label>
-                  <textarea
-                    data-focus-id="task-input"
-                    id="task-input"
-                    value={taskInput}
-                    onChange={event => setTaskInput(event.target.value)}
-                    onKeyDown={event => {
-                      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                        event.preventDefault()
-                        if (taskInput.trim() !== '' && !busy) handleSend()
-                      }
-                    }}
-                    placeholder="输入任务目标或继续说明"
-                    rows={5}
+                  <AttachmentRail
+                    images={pendingImages}
+                    onRemove={handleRemoveImage}
+                    onPreview={handlePreviewPendingImage}
+                  />
+                  <div className="composer-input-wrap">
+                    <textarea
+                      data-focus-id="task-input"
+                      id="task-input"
+                      value={taskInput}
+                      onChange={event => setTaskInput(event.target.value)}
+                      onKeyDown={event => {
+                        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                          event.preventDefault()
+                          if ((taskInput.trim() !== '' || pendingImages.length > 0) && !busy) handleSend()
+                        }
+                      }}
+                      placeholder={pendingImages.length > 0 ? "附加说明（可选）或按 Cmd+Enter 发送" : "输入任务目标，或粘贴 / 拖入图片"}
+                      rows={5}
+                    />
+                  </div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    multiple
+                    style={{ display: 'none' }}
+                    onChange={handleFileInputChange}
                   />
                   <div className="composer-actions">
                     <div className="composer-actions__left">
@@ -1472,14 +2041,30 @@ export function App() {
                         className={`button button--voice ${isVoiceActive ? 'button--voice-active' : ''}`}
                         type="button"
                         onClick={() => void handleVoiceInputTrigger('tap')}
-                        title={`语音输入 (手柄 Select 键 / 快捷键 Cmd+Shift+V)\n模拟按键: ${voiceConfig.targetKey}`}
+                        title={`语音输入 (手柄 ${GAMEPAD_BUTTON_OPTIONS.find(option => option.index === voiceConfig.gamepadButton)?.label ?? voiceConfig.gamepadButton} / 快捷键 Cmd+Shift+V)\n模拟按键: ${voiceConfig.targetKey}`}
                         aria-label="触发语音输入模拟按键"
                       >
                         <Mic className={`voice-icon ${isVoiceActive ? 'voice-icon--active' : ''}`} aria-hidden="true" />
                         <span>{isVoiceActive ? '正在听写...' : '语音输入'}</span>
                       </button>
+                      <button
+                        data-focus-id="attach-image"
+                        className="button button--secondary button--image"
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        title="添加图片 (支持 PNG, JPEG, WebP, GIF)"
+                        aria-label="添加图片附件"
+                      >
+                        <ImageIcon aria-hidden="true" />
+                        <span>图片</span>
+                      </button>
                     </div>
-                    <button data-focus-id="send-task" className="button button--primary button--tv" type="submit" disabled={taskInput.trim() === '' || busy}>
+                    <button
+                      data-focus-id="send-task"
+                      className="button button--primary button--tv"
+                      type="submit"
+                      disabled={(taskInput.trim() === '' && pendingImages.length === 0) || busy}
+                    >
                       <Send aria-hidden="true" />
                       发送
                     </button>
@@ -1504,6 +2089,7 @@ export function App() {
           onSelectChange={handleSelectArtifactChange}
           onAcceptChange={handleAcceptArtifactChange}
           onRequestRejectChange={requestRejectArtifactChange}
+          onEstablishBaseline={handleEstablishBaseline}
         />
       </div>
 
@@ -1533,8 +2119,31 @@ export function App() {
             closeCommandCenter()
           }
         }}>
-          <section className={selectedApproval === undefined && artifactConfirmation === undefined && artifactCommitFlow === undefined ? 'command-sheet' : 'command-sheet command-sheet--approval'} role="dialog" aria-modal="true" aria-labelledby="command-title">
-            {artifactConfirmation !== undefined ? (
+          <section className={selectedApproval === undefined && artifactConfirmation === undefined && artifactCommitFlow === undefined && !archiveViewOpen ? 'command-sheet' : 'command-sheet command-sheet--approval'} role="dialog" aria-modal="true" aria-labelledby="command-title">
+            {archiveViewOpen ? (
+              <>
+                <header className="command-header approval-header">
+                  <button data-focus-id="archive-back" className="icon-button icon-button--quiet" type="button" onClick={() => setArchiveViewOpen(false)} title="返回命令中心" aria-label="返回命令中心">
+                    <ArrowLeft aria-hidden="true" />
+                  </button>
+                  <div>
+                    <span className="step-label">任务管理</span>
+                    <h2 id="command-title">已归档任务</h2>
+                  </div>
+                  <span className="command-runtime">{archivedTaskList.length} 项</span>
+                </header>
+                <div className="command-list archive-list" data-scroll-region="archives">
+                  {archivedTaskList.length === 0 ? (
+                    <div className="archive-empty">暂无已归档任务</div>
+                  ) : archivedTaskList.map((task, index) => (
+                    <button key={task.id} data-focus-id={`archive-restore-${index}`} className="command-item" type="button" onClick={() => handleRestoreArchivedTask(task)}>
+                      <ArchiveRestore aria-hidden="true" />
+                      <span><strong>{task.title ?? shortId(task.id)}</strong><small>{task.workspacePath ?? task.id}</small></span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : artifactConfirmation !== undefined ? (
               <>
                 <header className="command-header artifact-confirmation__header">
                   <div>
@@ -1613,6 +2222,33 @@ export function App() {
                   <button data-focus-id="command-projects" className="command-item" type="button" onClick={openProjectCenter}>
                     <FolderKanban aria-hidden="true" />
                     <span><strong>选择项目</strong><small>{workspaceCatalog.baseDirectory ?? '设置工作区根目录'}</small></span>
+                  </button>
+                  {activeTask === undefined ? null : (
+                    <button
+                      data-focus-id="command-toggle-permission"
+                      className="command-item"
+                      type="button"
+                      onClick={() => {
+                        closeCommandCenter()
+                        void handleToggleActiveSessionPermission()
+                      }}
+                    >
+                      <ShieldCheck aria-hidden="true" />
+                      <span>
+                        <strong>切换会话权限（当前：{permissionLabel(activePermissionMode)}）</strong>
+                        <small>{activePermissionMode === 'full-access' ? '点击切为标准权限（敏感工具操作需审批）' : '点击切为完全访问（自动执行全部工具不弹审批）'}</small>
+                      </span>
+                    </button>
+                  )}
+                  {activeTask === undefined ? null : (
+                    <button data-focus-id="command-archive-task" className="command-item" type="button" disabled={activeTask.running || canPauseTask} onClick={handleArchiveTask}>
+                      <Archive aria-hidden="true" />
+                      <span><strong>归档当前任务</strong><small>{activeTask.running || canPauseTask ? '请先暂停任务' : '从工作区隐藏，可随时恢复'}</small></span>
+                    </button>
+                  )}
+                  <button data-focus-id="command-archives" className="command-item" type="button" onClick={() => setArchiveViewOpen(true)}>
+                    <ArchiveRestore aria-hidden="true" />
+                    <span><strong>已归档任务</strong><small>{archivedTaskList.length} 项，可恢复到原工作空间</small></span>
                   </button>
                   {canPauseTask ? (
                     <button
@@ -1725,6 +2361,7 @@ export function App() {
           projectName={projectName}
           onChangePermissionMode={setProjectPermissionMode}
           onChangeProjectName={setProjectName}
+          onChangeProjectPermission={handleChangeWorkspaceProjectPermission}
           onChooseBase={handleChooseWorkspaceBase}
           onClose={closeProjectCenter}
           onCreate={handleCreateWorkspaceProject}
@@ -1862,11 +2499,29 @@ export function App() {
               <div className="settings-section">
                 <div className="settings-section__header">
                   <span className="step-label">外设与输入法</span>
-                  <h3>语音输入与按键模拟</h3>
-                  <p>通过底层模拟按键联动 Spokenly、Superwhisper 或系统听写。手柄 Back/Select 键或键盘 Cmd+Shift+V / F5 可直接唤起。</p>
+                  <h3>语音输入与按键映射</h3>
+                  <p>指定手柄触发键，并通过底层按键模拟联动 Spokenly、Superwhisper 或系统听写。</p>
                 </div>
                 <div className="model-field">
-                  <label htmlFor="voice-input-key">触发按键 (Target Key)</label>
+                  <label htmlFor="voice-input-gamepad-button">手柄触发键</label>
+                  <select
+                    data-focus-id="voice-input-gamepad-button"
+                    id="voice-input-gamepad-button"
+                    value={voiceConfig.gamepadButton}
+                    onChange={event => {
+                      const next = { ...voiceConfig, gamepadButton: Number(event.target.value) as VoiceInputGamepadButton }
+                      setVoiceConfig(next)
+                      saveVoiceInputConfig(next)
+                      setVoiceTestStatus(undefined)
+                    }}
+                  >
+                    {GAMEPAD_BUTTON_OPTIONS.map(option => (
+                      <option key={option.index} value={option.index}>{option.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="model-field">
+                  <label htmlFor="voice-input-key">听写软件触发键</label>
                   <select
                     data-focus-id="voice-input-key"
                     id="voice-input-key"
@@ -1929,6 +2584,10 @@ export function App() {
           </section>
         </div>
       ) : null}
+      <ImageLightbox
+        image={lightboxImage}
+        onClose={closeImageLightbox}
+      />
     </main>
   )
 }
@@ -2156,11 +2815,20 @@ function projectionStatusLabel(status?: TaskProjection['status']): string {
   return '等待输入'
 }
 
-function permissionLabel(mode: TaskPermissionMode): string {
+export function resolveWorkspaceProjectPermission(
+  projects: readonly WorkspaceProject[],
+  workspacePath: string,
+  fallback: TaskPermissionMode = 'standard',
+): TaskPermissionMode {
+  const project = projects.find(p => p.path === workspacePath)
+  return project?.permissionMode ?? fallback
+}
+
+export function permissionLabel(mode: TaskPermissionMode): string {
   return mode === 'full-access' ? '完全访问' : '标准权限'
 }
 
-function permissionDescription(mode: TaskPermissionMode): string {
+export function permissionDescription(mode: TaskPermissionMode): string {
   return mode === 'full-access'
     ? '完全访问，不再逐项审批'
     : '标准权限，本次操作需要审批'
@@ -2255,6 +2923,32 @@ function formatTime(value: number): string {
   return new Intl.DateTimeFormat('zh-CN', {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   }).format(new Date(value))
+}
+
+export function sessionTitleFromProjectionEvent(event: TaskEvent): string | undefined {
+  if (event.type !== 'session/projection' || typeof event.data !== 'object' || event.data === null) return undefined
+  const projection = event.data as { key?: unknown, value?: unknown }
+  return projection.key === 'title' && typeof projection.value === 'string' && projection.value.trim() !== ''
+    ? projection.value
+    : undefined
+}
+
+export function cycleProjectIndex(currentIndex: number, totalCount: number, direction: 'previous' | 'next'): number {
+  if (totalCount <= 1) return 0
+  if (direction === 'previous') {
+    return currentIndex <= 0 ? totalCount - 1 : currentIndex - 1
+  }
+  return currentIndex < 0 || currentIndex >= totalCount - 1 ? 0 : currentIndex + 1
+}
+
+export function resolveReconnectionTask(
+  listed: readonly TaskSession[],
+  workspacePath: string,
+): TaskSession | undefined {
+  if (workspacePath === '') {
+    return listed[0]
+  }
+  return listed.find(t => t.workspacePath === workspacePath)
 }
 
 function shortId(value: string): string {
