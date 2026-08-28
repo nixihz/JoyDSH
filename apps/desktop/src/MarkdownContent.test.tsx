@@ -76,4 +76,14 @@ describe('MarkdownContent', () => {
     expect(html).toContain('<td>本地</td>')
     expect(html).toContain('<del>已废弃</del>')
   })
+
+  it('正确渲染 Markdown 图片标签', () => {
+    const md = '![架构图](https://example.com/arch.png)'
+    const html = renderToString(<MarkdownContent content={md} />)
+
+    expect(html).toContain('markdown-image-wrapper')
+    expect(html).toContain('markdown-image')
+    expect(html).toContain('src="https://example.com/arch.png"')
+    expect(html).toContain('alt="架构图"')
+  })
 })
