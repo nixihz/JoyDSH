@@ -1147,13 +1147,7 @@ async fn forward_event_stream(app: tauri::AppHandle, stream_name: &'static str) 
                 );
             }
             Err(_) => {
-                let _ = app.emit(
-                    &event_name,
-                    StreamFrame {
-                        kind: "close",
-                        data: None,
-                    },
-                );
+                // Background reconnection retry: do not emit close when connection was never established
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
