@@ -7,6 +7,7 @@ import type {
   TaskApprovalOutcome,
   TaskEvent,
   TaskPermissionMode,
+  TaskQuestionAnswer,
   TaskSession,
 } from '@joydsh/domain'
 import { z } from 'zod'
@@ -122,6 +123,26 @@ const eventEnvelopeSchema = z.object({
   payload: z.object({ type: z.string() }).passthrough(),
 })
 
+const questionRequestedPayloadSchema = z.object({
+  type: z.literal('question/requested'),
+  sessionId: z.string().min(1),
+  questions: z.array(z.object({
+    id: z.string(),
+    question: z.string(),
+    header: z.string().optional(),
+    detail: z.string().optional(),
+    options: z.array(z.object({
+      label: z.string(),
+      description: z.string().optional(),
+    })).optional(),
+    multiSelect: z.boolean().optional(),
+    intent: z.object({
+      kind: z.literal('plan-review'),
+      approve: z.string(),
+    }).optional(),
+  })).min(1),
+})
+
 const approvalReceiptSchema = z.discriminatedUnion('accepted', [
   z.object({ accepted: z.literal(true) }),
   z.object({
@@ -129,6 +150,20 @@ const approvalReceiptSchema = z.discriminatedUnion('accepted', [
     reason: z.enum(['not-pending', 'bad-response']),
   }),
 ])
+
+const commandExecutionSchema = z.object({
+  commandId: z.string().min(1),
+  result: z.discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('success'),
+      text: z.string().optional(),
+    }).passthrough(),
+    z.object({
+      kind: z.literal('error'),
+      text: z.string(),
+    }).passthrough(),
+  ]),
+}).passthrough().optional()
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -165,6 +200,8 @@ export interface DshAdapter {
   getAttachment(taskId: string, attachmentId: string): Promise<{ attachment: ImageAttachmentRef; data: string }>
   setTaskPermission(taskId: string, mode: TaskPermissionMode): Promise<void>
   respondToApproval(taskId: string, approval: TaskApproval, outcome: TaskApprovalOutcome): Promise<void>
+  respondToQuestion(taskId: string, requestId: string, answer: TaskQuestionAnswer): Promise<void>
+  cancelQuestion(requestId: string): Promise<void>
   pauseTask(taskId: string): Promise<void>
   stopTask(taskId: string): Promise<void>
   describeCredential(ref: string): Promise<CredentialStatus>
@@ -280,12 +317,23 @@ export class DshHttpAdapter implements DshAdapter {
 
   async setTaskPermission(taskId: string, mode: TaskPermissionMode): Promise<void> {
     const preset = mode === 'full-access' ? 'danger-full-access' : 'workspace-write'
-    await this.call('session.prompt', {
-      sessionId: taskId,
-      mode: 'queue',
-      content: [{ type: 'text', text: `/permission ${preset}` }],
-      clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    })
+    const execution = commandExecutionSchema.parse(await this.call('commands/execute', {
+      args: {
+        agentId: taskId,
+        line: `/permission ${preset}`,
+        images: [],
+      },
+    }))
+    if (execution === undefined) {
+      throw new DshAdapterError('permission-command-unavailable', '当前 DSH 运行时未提供权限切换命令')
+    }
+    if (execution.result.kind === 'error') {
+      throw new DshAdapterError(
+        'permission-command-failed',
+        execution.result.text,
+        { command: execution },
+      )
+    }
   }
 
   async respondToApproval(taskId: string, approval: TaskApproval, outcome: TaskApprovalOutcome): Promise<void> {
@@ -311,6 +359,54 @@ export class DshHttpAdapter implements DshAdapter {
     const receipt = approvalReceiptSchema.parse(await response.json())
     if (!receipt.accepted) {
       throw new DshAdapterError('approval-not-pending', '审批请求已经失效', { reason: receipt.reason })
+    }
+  }
+
+  async respondToQuestion(taskId: string, requestId: string, answer: TaskQuestionAnswer): Promise<void> {
+    const response = await this.fetch(new URL('/api/respond', this.baseUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-response',
+        rpcId: requestId,
+        result: {
+          ok: true,
+          value: { sessionId: taskId, answer },
+        },
+      }),
+    })
+    if (!response.ok) {
+      throw new DshAdapterError('transport-error', `DSH 问题回应失败：HTTP ${response.status}`)
+    }
+    const receipt = approvalReceiptSchema.parse(await response.json())
+    if (!receipt.accepted) {
+      throw new DshAdapterError('question-not-pending', '问题请求已经失效', { reason: receipt.reason })
+    }
+  }
+
+  async cancelQuestion(requestId: string): Promise<void> {
+    const response = await this.fetch(new URL('/api/respond', this.baseUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-response',
+        rpcId: requestId,
+        result: {
+          ok: false,
+          error: {
+            code: 'cancelled',
+            message: '用户取消了问题请求',
+            details: {},
+          },
+        },
+      }),
+    })
+    if (!response.ok) {
+      throw new DshAdapterError('transport-error', `DSH 问题取消失败：HTTP ${response.status}`)
+    }
+    const receipt = approvalReceiptSchema.parse(await response.json())
+    if (!receipt.accepted) {
+      throw new DshAdapterError('question-not-pending', '问题请求已经失效', { reason: receipt.reason })
     }
   }
 
@@ -452,6 +548,8 @@ export class DshHttpAdapter implements DshAdapter {
           }
           const parsed = eventEnvelopeSchema.safeParse(decoded)
           if (!parsed.success) return
+          if (parsed.data.payload.type === 'question/requested'
+            && !questionRequestedPayloadSchema.safeParse(parsed.data.payload).success) return
           subscription.onEvent(toTaskEvent(parsed.data.rpcId, parsed.data.payload))
         })
         socket.addEventListener('error', scheduleReconnect)

@@ -1,9 +1,18 @@
-import type { MessageImageItem, TaskApproval, TaskEvent, TaskPermissionMode } from '@joydsh/domain'
+import type {
+  MessageImageItem,
+  TaskApproval,
+  TaskEvent,
+  TaskPermissionMode,
+  TaskPlanReview,
+  TaskQuestionItem,
+  TaskQuestionRequest,
+} from '@joydsh/domain'
 
 export type TaskProjectionStatus =
   | 'idle'
   | 'running'
   | 'waiting-approval'
+  | 'waiting-response'
   | 'paused'
   | 'completed'
   | 'cancelled'
@@ -27,7 +36,7 @@ export interface TaskProjectionMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
   time: number
-  status?: ('streaming' | 'completed' | 'failed' | 'paused' | 'cancelled' | 'interrupted' | 'waiting-approval' | 'blocked' | 'max-tokens') | undefined
+  status?: ('streaming' | 'completed' | 'failed' | 'paused' | 'cancelled' | 'interrupted' | 'waiting-approval' | 'waiting-response' | 'blocked' | 'max-tokens') | undefined
   isSystemInjection?: boolean | undefined
   isCommand?: boolean | undefined
   failure?: TaskFailure | undefined
@@ -43,6 +52,8 @@ export interface TaskProjection {
   plan: readonly TaskPlanItem[]
   permissionMode: TaskPermissionMode
   pendingApprovals: readonly TaskApproval[]
+  pendingQuestions: readonly TaskQuestionRequest[]
+  pendingPlanReviews: readonly TaskPlanReview[]
   messages: readonly TaskProjectionMessage[]
   failure?: TaskFailure
 }
@@ -57,6 +68,8 @@ export function createTaskProjection(taskId: string): TaskProjection {
     plan: [],
     permissionMode: 'standard',
     pendingApprovals: [],
+    pendingQuestions: [],
+    pendingPlanReviews: [],
     messages: [],
   }
 }
@@ -66,11 +79,40 @@ export function synchronizeTaskRunning(
   running: boolean,
 ): TaskProjection {
   if (running) {
-    return state.status === 'waiting-approval' || state.status === 'running'
+    return state.status === 'waiting-approval' || state.status === 'waiting-response' || state.status === 'running'
       ? state
       : { ...state, status: 'running' }
   }
-  return state.status === 'running' ? { ...state, status: 'idle' } : state
+  if (state.status === 'running') {
+    return {
+      ...state,
+      status: 'idle',
+      messages: cleanPendingAssistantMessages(state.messages, 'completed'),
+    }
+  }
+  return state
+}
+
+function cleanPendingAssistantMessages(
+  messages: readonly TaskProjectionMessage[],
+  finalizedStatus: TaskProjectionMessage['status'] = 'completed',
+): readonly TaskProjectionMessage[] {
+  return messages
+    .filter(msg => {
+      if (msg.role === 'assistant' && msg.status === 'streaming') {
+        const hasContent = msg.content.trim() !== ''
+        const hasImages = msg.images !== undefined && msg.images.length > 0
+        const hasFailure = msg.failure !== undefined
+        return hasContent || hasImages || hasFailure
+      }
+      return true
+    })
+    .map(msg => {
+      if (msg.role === 'assistant' && msg.status === 'streaming') {
+        return { ...msg, status: finalizedStatus }
+      }
+      return msg
+    })
 }
 
 export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskProjection {
@@ -83,6 +125,8 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
   let plan = state.plan
   let permissionMode = state.permissionMode
   let pendingApprovals = state.pendingApprovals
+  let pendingQuestions = state.pendingQuestions
+  let pendingPlanReviews = state.pendingPlanReviews
   let failure = state.failure
   let messages = state.messages
 
@@ -96,6 +140,7 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
     const userText = extractUserMessage(event.data) ?? ''
     const userImages = extractMessageImages(event.data, event.id)
     if (userText.trim() !== '' || (userImages !== undefined && userImages.length > 0)) {
+      messages = cleanPendingAssistantMessages(messages)
       const isSystemInjection = isSystemContextInjection(userText)
       const isCommand = isCommandPrompt(userText)
       const existingIdx = messages.findIndex(msg =>
@@ -120,20 +165,18 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
 
   // Handle turn/start -> initiate a new assistant turn bubble
   if (event.type === 'turn/start') {
+    messages = cleanPendingAssistantMessages(messages)
     const assistantId = `assistant:${event.id || event.sequence || event.time}`
-    const lastMsg = messages.at(-1)
-    if (lastMsg === undefined || lastMsg.role !== 'assistant' || lastMsg.status !== 'streaming') {
-      messages = [
-        ...messages,
-        {
-          id: assistantId,
-          role: 'assistant',
-          content: '',
-          time: event.time,
-          status: 'streaming',
-        },
-      ]
-    }
+    messages = [
+      ...messages,
+      {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        time: event.time,
+        status: 'streaming',
+      },
+    ]
   }
 
   const delta = extractTextDelta(event.data)
@@ -191,7 +234,7 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
   const todoSnapshot = extractTodoSnapshot(event.data)
   if (event.type === 'todo/write' && todoSnapshot !== undefined) plan = todoSnapshot
   const nextPermissionMode = extractPermissionMode(event.data)
-  if ((event.type === 'permission/preset' || event.type === 'permission/update' || event.type === 'user/message') && nextPermissionMode !== undefined) {
+  if ((event.type === 'permission/preset' || event.type === 'permission/update') && nextPermissionMode !== undefined) {
     permissionMode = nextPermissionMode
   }
   const requestedApproval = extractRequestedApproval(event)
@@ -205,36 +248,47 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
   if (event.type === 'approval/resolved' && resolvedApprovalId !== undefined) {
     pendingApprovals = pendingApprovals.filter(approval => approval.approvalId !== resolvedApprovalId)
   }
+  const requestedQuestions = extractQuestionRequest(event)
+  if (event.type === 'question/requested' && requestedQuestions !== undefined) {
+    const planReview = planReviewOf(requestedQuestions)
+    if (planReview === undefined) {
+      pendingQuestions = [
+        ...pendingQuestions.filter(request => request.requestId !== requestedQuestions.requestId),
+        requestedQuestions,
+      ]
+    } else {
+      pendingQuestions = pendingQuestions.filter(request => request.requestId !== requestedQuestions.requestId)
+      pendingPlanReviews = [
+        ...pendingPlanReviews.filter(review => review.requestId !== planReview.requestId),
+        planReview,
+      ]
+    }
+  }
+  const resolvedQuestionId = extractResolvedQuestionId(event.data)
+  if (event.type === 'question/resolved' && resolvedQuestionId !== undefined) {
+    pendingQuestions = pendingQuestions.filter(request => request.requestId !== resolvedQuestionId)
+    pendingPlanReviews = pendingPlanReviews.filter(review => review.requestId !== resolvedQuestionId)
+  }
 
   if (eventFailure !== undefined) {
     failure = eventFailure
-    const lastMsg = messages.at(-1)
-    if (lastMsg !== undefined && lastMsg.role === 'assistant') {
-      const updated: TaskProjectionMessage = {
-        ...lastMsg,
-        status: 'failed',
-        failure: eventFailure,
-      }
-      messages = [...messages.slice(0, -1), updated]
-    }
+    messages = cleanPendingAssistantMessages(messages, 'failed').map(m =>
+      m.status === 'failed' ? { ...m, failure: m.failure ?? eventFailure } : m
+    )
   }
 
   if (event.type === 'turn/end') {
     const endStatus = extractTurnEndStatus(event.data) ?? 'idle'
     status = endStatus
-    const lastMsg = messages.at(-1)
-    if (lastMsg !== undefined && lastMsg.role === 'assistant') {
-      const updated: TaskProjectionMessage = {
-        ...lastMsg,
-        status: endStatus === 'idle' || endStatus === 'completed' ? 'completed' : endStatus,
-      }
-      messages = [...messages.slice(0, -1), updated]
-    }
+    const targetStatus = endStatus === 'idle' || endStatus === 'completed' ? 'completed' : endStatus
+    messages = cleanPendingAssistantMessages(messages, targetStatus)
   }
 
   if (event.kind === 'error' || eventFailure !== undefined) status = 'failed'
   else if (pendingApprovals.length > 0) status = 'waiting-approval'
+  else if (pendingQuestions.length > 0 || pendingPlanReviews.length > 0) status = 'waiting-response'
   else if (event.type === 'approval/resolved' && state.status === 'waiting-approval') status = 'running'
+  else if (event.type === 'question/resolved' && state.status === 'waiting-response') status = 'running'
   else if (isTurnStartEvent(event.type) || isTurnActiveEvent(event.type) || (event.type === 'host/session-status' && isRunning(event.data))) status = 'running'
   else if (event.type === 'turn/end') status = extractTurnEndStatus(event.data) ?? 'idle'
   else if (event.type === 'host/session-status' && status === 'running') status = 'idle'
@@ -248,6 +302,8 @@ export function projectTaskEvent(state: TaskProjection, event: TaskEvent): TaskP
     plan,
     permissionMode,
     pendingApprovals,
+    pendingQuestions,
+    pendingPlanReviews,
     messages,
   }
   if (failure !== undefined) return { ...projected, failure }
@@ -288,21 +344,10 @@ function extractTextDelta(data: unknown): string | undefined {
 }
 
 function extractPermissionMode(data: unknown): TaskPermissionMode | undefined {
-  const preset = record(data)?.preset
+  const value = record(data)
+  const preset = value?.preset ?? value?.sandboxPolicy ?? value?.sandbox_policy
   if (preset === 'workspace-write' || preset === 'standard') return 'standard'
   if (preset === 'danger-full-access' || preset === 'danger:full-access' || preset === 'full-access') return 'full-access'
-  const text = record(data)?.text
-  if (typeof text === 'string') {
-    const trimmed = text.trim()
-    if (trimmed.startsWith('/permission')) {
-      if (trimmed.includes('danger-full-access') || trimmed.includes('danger:full-access') || trimmed.includes('full-access')) {
-        return 'full-access'
-      }
-      if (trimmed.includes('workspace-write') || trimmed.includes('standard')) {
-        return 'standard'
-      }
-    }
-  }
   return undefined
 }
 
@@ -321,6 +366,66 @@ function extractRequestedApproval(event: TaskEvent): TaskApproval | undefined {
 function extractResolvedApprovalId(data: unknown): string | undefined {
   const approvalId = record(data)?.approvalId
   return typeof approvalId === 'string' ? approvalId : undefined
+}
+
+function extractQuestionRequest(event: TaskEvent): TaskQuestionRequest | undefined {
+  const value = record(event.data)
+  if (value === undefined || !Array.isArray(value.questions) || value.questions.length === 0) return undefined
+  const questions: TaskQuestionItem[] = []
+  for (const candidate of value.questions) {
+    const question = record(candidate)
+    if (question === undefined || typeof question.id !== 'string' || typeof question.question !== 'string') return undefined
+    let options: TaskQuestionItem['options']
+    if (Array.isArray(question.options)) {
+      const parsedOptions = []
+      for (const option of question.options) {
+        const value = record(option)
+        if (value === undefined || typeof value.label !== 'string') return undefined
+        parsedOptions.push({
+          label: value.label,
+          ...(typeof value.description === 'string' ? { description: value.description } : {}),
+        })
+      }
+      options = parsedOptions
+    }
+    const intentValue = record(question.intent)
+    const intent = intentValue?.kind === 'plan-review' && typeof intentValue.approve === 'string'
+      ? { kind: 'plan-review' as const, approve: intentValue.approve }
+      : undefined
+    questions.push({
+      id: question.id,
+      question: question.question,
+      ...(typeof question.header === 'string' ? { header: question.header } : {}),
+      ...(typeof question.detail === 'string' ? { detail: question.detail } : {}),
+      ...(options === undefined ? {} : { options }),
+      ...(typeof question.multiSelect === 'boolean' ? { multiSelect: question.multiSelect } : {}),
+      ...(intent === undefined ? {} : { intent }),
+    })
+  }
+  return { requestId: event.id, questions }
+}
+
+function planReviewOf(request: TaskQuestionRequest): TaskPlanReview | undefined {
+  if (request.questions.length !== 1) return undefined
+  const question = request.questions[0]
+  if (question === undefined || question.intent?.kind !== 'plan-review' || question.detail === undefined) return undefined
+  if (question.multiSelect === true || question.options?.length !== 2) return undefined
+  const approve = question.options.find(option => option.label === question.intent?.approve)
+  if (approve === undefined) return undefined
+  const decline = question.options.find(option => option.label !== approve.label)
+  return {
+    requestId: request.requestId,
+    id: question.id,
+    question: question.question,
+    plan: question.detail,
+    approve,
+    ...(decline === undefined ? {} : { decline }),
+  }
+}
+
+function extractResolvedQuestionId(data: unknown): string | undefined {
+  const questionRpcId = record(data)?.questionRpcId
+  return typeof questionRpcId === 'string' ? questionRpcId : undefined
 }
 
 function extractTodoSnapshot(data: unknown): TaskPlanItem[] | undefined {
@@ -392,6 +497,7 @@ function extractUserMessage(data: unknown): string | undefined {
 function isSystemContextInjection(text: string): boolean {
   const trimmed = text.trim()
   return trimmed.startsWith('<system-reminder>')
+    || trimmed.startsWith('<skill_content')
     || trimmed.startsWith('Current runtime context')
     || trimmed.startsWith('instructions from: AGENTS.md')
     || trimmed.includes('<system-reminder>')

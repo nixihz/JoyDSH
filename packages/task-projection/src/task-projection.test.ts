@@ -203,6 +203,139 @@ describe('任务事件投影', () => {
     expect(resolved.status).toBe('running')
   })
 
+  it('投影并解决一整组普通待回应问题', () => {
+    const requested = projectTaskEvent(createTaskProjection('task-1'), {
+      id: 'question-rpc-1',
+      taskId: 'task-1',
+      kind: 'control',
+      type: 'question/requested',
+      time: 30,
+      data: {
+        type: 'question/requested',
+        sessionId: 'task-1',
+        questions: [
+          {
+            id: 'delivery-mode',
+            header: '交付方式',
+            question: '优先采用哪种交付方式？',
+            options: [{ label: '纵向切片', description: '先贯通一条任务闭环。' }],
+          },
+          {
+            id: 'risk',
+            question: '还有哪些风险？',
+            multiSelect: true,
+          },
+        ],
+      },
+    })
+    const resolved = projectTaskEvent(requested, {
+      id: 'question-resolved-1',
+      taskId: 'task-1',
+      kind: 'control',
+      type: 'question/resolved',
+      time: 31,
+      data: {
+        type: 'question/resolved',
+        sessionId: 'task-1',
+        questionRpcId: 'question-rpc-1',
+        outcome: 'answered',
+      },
+    })
+
+    expect(requested.status).toBe('waiting-response')
+    expect(requested.pendingQuestions).toEqual([{
+      requestId: 'question-rpc-1',
+      questions: [
+        {
+          id: 'delivery-mode',
+          header: '交付方式',
+          question: '优先采用哪种交付方式？',
+          options: [{ label: '纵向切片', description: '先贯通一条任务闭环。' }],
+        },
+        {
+          id: 'risk',
+          question: '还有哪些风险？',
+          multiSelect: true,
+        },
+      ],
+    }])
+    expect(requested.pendingPlanReviews).toEqual([])
+    expect(resolved.pendingQuestions).toEqual([])
+    expect(resolved.status).toBe('running')
+  })
+
+  it('把可完整表达的方案审阅从普通问题中独立投影', () => {
+    const requested = projectTaskEvent(createTaskProjection('task-1'), {
+      id: 'plan-review-rpc-1',
+      taskId: 'task-1',
+      kind: 'control',
+      type: 'question/requested',
+      time: 40,
+      data: {
+        type: 'question/requested',
+        sessionId: 'task-1',
+        questions: [{
+          id: 'review-plan',
+          question: '是否按此方案开始实施？',
+          detail: '## 方案\n\n先贯通问题回应闭环。',
+          options: [
+            { label: '批准方案', description: '退出方案模式并开始实施。' },
+            { label: '继续修改', description: '保留方案模式并补充要求。' },
+          ],
+          intent: { kind: 'plan-review', approve: '批准方案' },
+        }],
+      },
+    })
+
+    expect(requested.status).toBe('waiting-response')
+    expect(requested.pendingQuestions).toEqual([])
+    expect(requested.pendingPlanReviews).toEqual([{
+      requestId: 'plan-review-rpc-1',
+      id: 'review-plan',
+      question: '是否按此方案开始实施？',
+      plan: '## 方案\n\n先贯通问题回应闭环。',
+      approve: { label: '批准方案', description: '退出方案模式并开始实施。' },
+      decline: { label: '继续修改', description: '保留方案模式并补充要求。' },
+    }])
+  })
+
+  it('把非二元方案意图回退为普通问题以保留答案表达能力', () => {
+    const requested = projectTaskEvent(createTaskProjection('task-1'), {
+      id: 'plan-review-single-option',
+      taskId: 'task-1',
+      kind: 'control',
+      type: 'question/requested',
+      time: 41,
+      data: {
+        type: 'question/requested',
+        questions: [{
+          id: 'review-plan',
+          question: '是否执行？',
+          detail: '# 实施方案',
+          options: [{ label: '批准方案' }],
+          intent: { kind: 'plan-review', approve: '批准方案' },
+        }],
+      },
+    })
+
+    expect(requested.pendingPlanReviews).toEqual([])
+    expect(requested.pendingQuestions).toHaveLength(1)
+  })
+
+  it('只根据宿主权限事件更新权限，不把用户命令当成已生效状态', () => {
+    const command = projectTaskEvent(createTaskProjection('task-1'), {
+      ...event('user/message', 1),
+      data: { text: '/permission danger-full-access' },
+    })
+    const updated = projectTaskEvent(command, {
+      ...event('permission/update', 2),
+      data: { sandboxPolicy: 'danger-full-access' },
+    })
+
+    expect(command.permissionMode).toBe('standard')
+    expect(updated.permissionMode).toBe('full-access')
+  })
+
   it('收到 request/header 或 user/message 时自动切换为 running 并清空上回合输出', () => {
     const previous = {
       ...createTaskProjection('task-1'),
@@ -314,16 +447,22 @@ describe('任务事件投影', () => {
     })
     proj = projectTaskEvent(proj, {
       ...event('user/message', 3),
+      data: { text: '<skill_content name="handoff">\n<skill_resources>...</skill_resources>\n</skill_content>' },
+    })
+    proj = projectTaskEvent(proj, {
+      ...event('user/message', 4),
       data: { text: '真实用户需求' },
     })
 
-    expect(proj.messages).toHaveLength(3)
+    expect(proj.messages).toHaveLength(4)
     expect(proj.messages[0]?.isSystemInjection).toBe(true)
     expect(proj.messages[0]?.role).toBe('system')
     expect(proj.messages[1]?.isCommand).toBe(true)
     expect(proj.messages[1]?.role).toBe('user')
-    expect(proj.messages[2]?.isSystemInjection).toBe(false)
-    expect(proj.messages[2]?.role).toBe('user')
+    expect(proj.messages[2]?.isSystemInjection).toBe(true)
+    expect(proj.messages[2]?.role).toBe('system')
+    expect(proj.messages[3]?.isSystemInjection).toBe(false)
+    expect(proj.messages[3]?.role).toBe('user')
   })
 
   it('解析用户与助手消息中的图片附件', () => {
@@ -419,5 +558,57 @@ describe('任务事件投影', () => {
 
     expect(first.messages[0]?.images?.[0]?.id).toBe(`${imageEvent.id}:image-0`)
     expect(second.messages[0]?.images?.[0]?.id).toBe(first.messages[0]?.images?.[0]?.id)
+  })
+
+  it('用户发送新消息时清理历史悬挂的空 Assistant 占位', () => {
+    // 1. turn/start 产生了一个空的 assistant 占位
+    const proj1 = projectTaskEvent(createTaskProjection('task-1'), event('turn/start', 1))
+    expect(proj1.messages).toHaveLength(1)
+    expect(proj1.messages[0]?.role).toBe('assistant')
+    expect(proj1.messages[0]?.status).toBe('streaming')
+    expect(proj1.messages[0]?.content).toBe('')
+
+    // 2. 紧接着用户发送了命令/消息（例如权限命令），未经历 turn/end
+    const proj2 = projectTaskEvent(proj1, {
+      ...event('user/message', 2),
+      data: { text: '/permission danger-full-access' },
+    })
+
+    // 空的占位应该被清理，只保留用户的消息
+    expect(proj2.messages).toHaveLength(1)
+    expect(proj2.messages[0]?.role).toBe('user')
+    expect(proj2.messages[0]?.content).toBe('/permission danger-full-access')
+  })
+
+  it('用户发送新消息时将历史已有内容的 streaming 消息闭合为 completed', () => {
+    const proj1 = projectTaskEvent(createTaskProjection('task-1'), event('turn/start', 1))
+    const proj2 = projectTaskEvent(proj1, {
+      ...event('assistant/chunk', 2),
+      data: { chunk: { type: 'text-delta', text: '你好，我是助手' } },
+    })
+    expect(proj2.messages[0]?.status).toBe('streaming')
+
+    const proj3 = projectTaskEvent(proj2, {
+      ...event('user/message', 3),
+      data: { text: '新问题' },
+    })
+
+    expect(proj3.messages).toHaveLength(2)
+    expect(proj3.messages[0]?.role).toBe('assistant')
+    expect(proj3.messages[0]?.status).toBe('completed')
+    expect(proj3.messages[0]?.content).toBe('你好，我是助手')
+    expect(proj3.messages[1]?.role).toBe('user')
+    expect(proj3.messages[1]?.content).toBe('新问题')
+  })
+
+  it('回合结束时清理空的 assistant 消息并收敛所有 streaming 状态', () => {
+    const proj1 = projectTaskEvent(createTaskProjection('task-1'), event('turn/start', 1))
+    const proj2 = projectTaskEvent(proj1, {
+      ...event('turn/end', 2),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })
+
+    // 空占位在 turn/end 后不应残留
+    expect(proj2.messages).toHaveLength(0)
   })
 })

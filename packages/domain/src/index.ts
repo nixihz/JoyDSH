@@ -27,6 +27,50 @@ export interface TaskApproval {
 
 export type TaskApprovalOutcome = 'allowed-once' | 'rejected'
 
+export interface TaskQuestionOption {
+  label: string
+  description?: string
+}
+
+export interface TaskQuestionIntent {
+  kind: 'plan-review'
+  approve: string
+}
+
+export interface TaskQuestionItem {
+  id: string
+  question: string
+  header?: string
+  detail?: string
+  options?: readonly TaskQuestionOption[]
+  multiSelect?: boolean
+  intent?: TaskQuestionIntent
+}
+
+export interface TaskQuestionRequest {
+  requestId: string
+  questions: readonly TaskQuestionItem[]
+}
+
+export interface TaskPlanReview {
+  requestId: string
+  id: string
+  question: string
+  plan: string
+  approve: TaskQuestionOption
+  decline?: TaskQuestionOption
+}
+
+export interface TaskQuestionAnswerItem {
+  id: string
+  selected: readonly string[]
+  custom?: string
+}
+
+export interface TaskQuestionAnswer {
+  answers: readonly TaskQuestionAnswerItem[]
+}
+
 export type TaskEventKind = 'session' | 'host' | 'control' | 'error'
 
 export interface TaskEvent {

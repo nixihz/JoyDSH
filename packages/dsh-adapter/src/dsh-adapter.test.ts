@@ -203,6 +203,57 @@ describe('DSH 适配契约', () => {
     expect(sockets.every(socket => socket.closed)).toBe(true)
   })
 
+  it('只交付符合 DSH 协议的结构化问题请求', () => {
+    const sockets: FakeSocket[] = []
+    const adapter = new DshHttpAdapter({
+      baseUrl: 'http://127.0.0.1:43127',
+      webSocketFactory: () => {
+        const socket = new FakeSocket()
+        sockets.push(socket)
+        return socket
+      },
+    })
+    const events: Array<{ id: string, taskId: string | undefined, type: string, data: unknown }> = []
+    const unsubscribe = adapter.subscribe({
+      onEvent: event => events.push({ id: event.id, taskId: event.taskId, type: event.type, data: event.data }),
+    })
+
+    for (const [rpcId, questions] of [
+      ['question-invalid', [{ id: 'missing-copy' }]],
+      ['question-valid', [{
+        id: 'delivery-mode',
+        header: '交付方式',
+        question: '优先采用哪种交付方式？',
+        options: [{ label: '纵向切片', description: '先贯通一条任务闭环。' }],
+      }]],
+    ] as const) {
+      sockets[0]?.emit('message', {
+        data: JSON.stringify({
+          type: 'server-request',
+          rpcId,
+          payload: { type: 'question/requested', sessionId: 'session-1', questions },
+        }),
+      } as MessageEvent)
+    }
+    unsubscribe()
+
+    expect(events).toEqual([{
+      id: 'question-valid',
+      taskId: 'session-1',
+      type: 'question/requested',
+      data: {
+        type: 'question/requested',
+        sessionId: 'session-1',
+        questions: [{
+          id: 'delivery-mode',
+          header: '交付方式',
+          question: '优先采用哪种交付方式？',
+          options: [{ label: '纵向切片', description: '先贯通一条任务闭环。' }],
+        }],
+      },
+    }])
+  })
+
   it('连接失败后进入 disconnected 并在静默重试期间避免 connecting 闪烁', () => {
     vi.useFakeTimers()
     try {
@@ -426,7 +477,13 @@ describe('DSH 适配契约', () => {
       return Response.json({
         type: 'server-response',
         rpcId: request.rpcId,
-        result: { ok: true, value: { accepted: true, command: { kind: 'success' } } },
+        result: {
+          ok: true,
+          value: {
+            commandId: 'permission',
+            result: { kind: 'success', text: 'preset updated' },
+          },
+        },
       })
     })
     const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
@@ -434,32 +491,67 @@ describe('DSH 适配契约', () => {
     await adapter.setTaskPermission('session-1', 'full-access')
     await adapter.setTaskPermission('session-1', 'standard')
 
-    expect(requests.map(request => ({
-      method: request.method,
-      payload: {
-        ...(request.payload as Record<string, unknown>),
-        clientTimeZone: '<timezone>',
-      },
-    }))).toEqual([
+    expect(requests).toEqual([
       {
-        method: 'session.prompt',
+        method: 'commands/execute',
         payload: {
-          sessionId: 'session-1',
-          mode: 'queue',
-          content: [{ type: 'text', text: '/permission danger-full-access' }],
-          clientTimeZone: '<timezone>',
+          args: {
+            agentId: 'session-1',
+            line: '/permission danger-full-access',
+            images: [],
+          },
         },
       },
       {
-        method: 'session.prompt',
+        method: 'commands/execute',
         payload: {
-          sessionId: 'session-1',
-          mode: 'queue',
-          content: [{ type: 'text', text: '/permission workspace-write' }],
-          clientTimeZone: '<timezone>',
+          args: {
+            agentId: 'session-1',
+            line: '/permission workspace-write',
+            images: [],
+          },
         },
       },
     ])
+  })
+
+  it('权限命令未注册时报告失败', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { rpcId: string }
+      return Response.json({
+        type: 'server-response',
+        rpcId: request.rpcId,
+        result: { ok: true },
+      })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    await expect(adapter.setTaskPermission('session-1', 'full-access')).rejects.toMatchObject({
+      code: 'permission-command-unavailable',
+    })
+  })
+
+  it('权限命令执行失败时透传宿主错误', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { rpcId: string }
+      return Response.json({
+        type: 'server-response',
+        rpcId: request.rpcId,
+        result: {
+          ok: true,
+          value: {
+            commandId: 'permission',
+            result: { kind: 'error', text: '不支持该权限预设' },
+          },
+        },
+      })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    await expect(adapter.setTaskPermission('session-1', 'full-access')).rejects.toMatchObject({
+      code: 'permission-command-failed',
+      message: '不支持该权限预设',
+    })
   })
 
   it('暂停任务时只中断当前 DSH 回合', async () => {
@@ -510,6 +602,66 @@ describe('DSH 适配契约', () => {
             approvalId: 'approval-1',
             outcome: 'allowed-once',
           },
+        },
+      },
+    }])
+  })
+
+  it('用问题请求的 rpcId 提交覆盖整组问题的结构化回答', async () => {
+    const calls: Array<{ url: string, body: unknown }> = []
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: JSON.parse(String(init?.body)) })
+      return Response.json({ accepted: true })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    await adapter.respondToQuestion('session-1', 'question-rpc-1', {
+      answers: [
+        { id: 'delivery-mode', selected: ['纵向切片'] },
+        { id: 'risk', selected: ['协议兼容'], custom: '保留未知意图的通用回退' },
+      ],
+    })
+
+    expect(calls).toEqual([{
+      url: 'http://127.0.0.1:43127/api/respond',
+      body: {
+        type: 'client-response',
+        rpcId: 'question-rpc-1',
+        result: {
+          ok: true,
+          value: {
+            sessionId: 'session-1',
+            answer: {
+              answers: [
+                { id: 'delivery-mode', selected: ['纵向切片'] },
+                { id: 'risk', selected: ['协议兼容'], custom: '保留未知意图的通用回退' },
+              ],
+            },
+          },
+        },
+      },
+    }])
+  })
+
+  it('取消问题请求时返回 DSH cancelled 错误结果', async () => {
+    const calls: unknown[] = []
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body)))
+      return Response.json({ accepted: true })
+    })
+    const adapter = new DshHttpAdapter({ baseUrl: 'http://127.0.0.1:43127', fetch })
+
+    await adapter.cancelQuestion('question-rpc-1')
+
+    expect(calls).toEqual([{
+      type: 'client-response',
+      rpcId: 'question-rpc-1',
+      result: {
+        ok: false,
+        error: {
+          code: 'cancelled',
+          message: '用户取消了问题请求',
+          details: {},
         },
       },
     }])
