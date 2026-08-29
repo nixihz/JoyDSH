@@ -32,6 +32,7 @@ use worktree::{FileStatus, TaskBaseline};
 use worktree_commits::WorktreeCommit;
 
 mod key_simulation;
+mod screen_capture;
 mod task_artifacts;
 mod task_commits;
 mod workspace_catalog;
@@ -683,16 +684,22 @@ fn runtime_unavailable_message(error: String) -> String {
 }
 
 #[tauri::command]
-fn simulate_key_action(
+async fn simulate_key_action(
     target: key_simulation::VirtualKeyTarget,
     action: key_simulation::KeySimulationAction,
 ) -> Result<(), String> {
+    key_simulation::ensure_permission().await?;
     key_simulation::simulate_key(&target, &action)
 }
 
 #[tauri::command]
-fn check_key_simulation_support() -> key_simulation::KeySimulationCapabilities {
-    key_simulation::check_capabilities()
+async fn check_key_simulation_support() -> key_simulation::KeySimulationCapabilities {
+    key_simulation::check_permission(key_simulation::check_capabilities()).await
+}
+
+#[tauri::command]
+async fn request_key_simulation_permission() -> key_simulation::KeySimulationCapabilities {
+    key_simulation::request_permission().await
 }
 
 #[tauri::command]
@@ -766,10 +773,7 @@ async fn dsh_rpc(
     method: String,
     request: Value,
 ) -> Result<Value, String> {
-    if !method
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
-    {
+    if !is_valid_dsh_rpc_method(&method) {
         return Err("DSH RPC 方法名无效".into());
     }
     let _guard = if rpc_requires_artifact_gate(&method) {
@@ -778,6 +782,18 @@ async fn dsh_rpc(
         None
     };
     send_dsh_rpc(&manager.http, &method, &request).await
+}
+
+fn is_valid_dsh_rpc_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
 }
 
 async fn send_dsh_rpc(
@@ -1258,6 +1274,8 @@ pub fn run() {
             commit_task_artifacts,
             simulate_key_action,
             check_key_simulation_support,
+            request_key_simulation_permission,
+            screen_capture::capture_screen,
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) {
@@ -1580,6 +1598,35 @@ mod tests {
         let error = parse_dsh_response_body(b"{not-json").unwrap_err();
 
         assert!(error.contains("DSH 响应不是有效 JSON"));
+    }
+
+    #[test]
+    fn rpc_method_accepts_safe_remote_command_paths() {
+        for method in [
+            "session.prompt",
+            "respond",
+            "commands/list",
+            "commands/execute",
+            "future-service/action_v2",
+        ] {
+            assert!(is_valid_dsh_rpc_method(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn rpc_method_rejects_empty_or_unsafe_path_segments() {
+        for method in [
+            "",
+            "/commands/execute",
+            "commands/execute/",
+            "commands//execute",
+            "commands/../execute",
+            "commands/./execute",
+            "commands/execute?admin=true",
+            "commands\\execute",
+        ] {
+            assert!(!is_valid_dsh_rpc_method(method), "{method}");
+        }
     }
 
     #[test]

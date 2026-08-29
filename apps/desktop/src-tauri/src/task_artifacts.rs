@@ -3842,7 +3842,10 @@ mod tests {
 
         // ensure_baseline should succeed by binding to HEAD
         let baseline = store.ensure_baseline("dirty-task", &repository).unwrap();
-        assert_eq!(baseline.repository_root, fs::canonicalize(&repository).unwrap());
+        assert_eq!(
+            baseline.repository_root,
+            fs::canonicalize(&repository).unwrap()
+        );
         assert!(!baseline.revision.is_empty());
 
         // inspect should now work and detect the 2 changes

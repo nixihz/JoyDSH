@@ -11,14 +11,11 @@ export type VoiceInputTargetKey =
   | 'space'
   | 'custom'
 
-export type VoiceInputMode = 'toggle' | 'push-to-talk'
-
 export type VoiceInputGamepadButton = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 10 | 11
 
 export interface VoiceInputConfig {
   enabled: boolean
   targetKey: VoiceInputTargetKey
-  mode: VoiceInputMode
   gamepadButton: VoiceInputGamepadButton
   customKeyCode?: number
 }
@@ -29,15 +26,17 @@ export interface KeySimulationCapabilities {
   supported: boolean
   platform: string
   defaultTarget: string | Record<string, unknown>
+  permissionRequired: boolean
+  permissionGranted: boolean | null
 }
 
 const STORAGE_KEY = 'joydsh:voice-input-config'
+const STORAGE_VERSION = 2
 
 export const DEFAULT_VOICE_INPUT_CONFIG: VoiceInputConfig = {
   enabled: true,
   targetKey: 'right-command',
-  mode: 'toggle',
-  gamepadButton: 8,
+  gamepadButton: 11,
 }
 
 export const GAMEPAD_BUTTON_OPTIONS: ReadonlyArray<{ index: VoiceInputGamepadButton, label: string }> = [
@@ -55,6 +54,21 @@ export const GAMEPAD_BUTTON_OPTIONS: ReadonlyArray<{ index: VoiceInputGamepadBut
 ]
 
 const GAMEPAD_BUTTONS = new Set<number>(GAMEPAD_BUTTON_OPTIONS.map(option => option.index))
+
+const GAMEPAD_BUTTON_CONFLICTS: Partial<Record<VoiceInputGamepadButton, string>> = {
+  0: '确认',
+  1: '返回',
+  2: '主要操作',
+  3: '更多操作',
+  4: '上一个项目',
+  5: '下一个项目',
+  6: '上一页',
+  7: '下一页',
+}
+
+export function gamepadButtonConflict(button: VoiceInputGamepadButton): string | undefined {
+  return GAMEPAD_BUTTON_CONFLICTS[button]
+}
 
 export const TARGET_KEY_OPTIONS: ReadonlyArray<{ key: VoiceInputTargetKey, label: string, description: string }> = [
   { key: 'right-command', label: 'Right Command (右 Cmd)', description: 'Spokenly / Superwhisper 推荐' },
@@ -78,7 +92,6 @@ export function loadVoiceInputConfig(): VoiceInputConfig {
     const config: VoiceInputConfig = {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : DEFAULT_VOICE_INPUT_CONFIG.enabled,
       targetKey: parsed.targetKey ?? DEFAULT_VOICE_INPUT_CONFIG.targetKey,
-      mode: parsed.mode === 'push-to-talk' ? 'push-to-talk' : 'toggle',
       gamepadButton: GAMEPAD_BUTTONS.has(parsed.gamepadButton as number)
         ? parsed.gamepadButton as VoiceInputGamepadButton
         : DEFAULT_VOICE_INPUT_CONFIG.gamepadButton,
@@ -92,7 +105,7 @@ export function loadVoiceInputConfig(): VoiceInputConfig {
 
 export function saveVoiceInputConfig(config: VoiceInputConfig): void {
   if (typeof window === 'undefined' || !window.localStorage) return
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ version: STORAGE_VERSION, ...config }))
 }
 
 export function toVirtualKeyTarget(targetKey: VoiceInputTargetKey, customKeyCode?: number): Record<string, unknown> | string {
@@ -138,6 +151,26 @@ export async function checkKeySimulationSupport(): Promise<KeySimulationCapabili
       supported: false,
       platform: 'browser-preview',
       defaultTarget: 'rightCommand',
+      permissionRequired: false,
+      permissionGranted: null,
     }
+  }
+}
+
+export async function requestKeySimulationPermission(): Promise<KeySimulationCapabilities> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    return await invoke<KeySimulationCapabilities>('request_key_simulation_permission')
+  } catch (error) {
+    if (typeof window !== 'undefined' && !(window as any).__TAURI_INTERNALS__) {
+      return {
+        supported: false,
+        platform: 'browser-preview',
+        defaultTarget: 'rightCommand',
+        permissionRequired: false,
+        permissionGranted: null,
+      }
+    }
+    throw error
   }
 }

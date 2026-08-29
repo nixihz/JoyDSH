@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { TaskApproval, TaskEvent, TaskFileChange } from '@joydsh/domain'
+import type { TaskApproval, TaskEvent, TaskFileChange, TaskQuestionRequest } from '@joydsh/domain'
 import { createTaskProjection, projectTaskEvent } from '@joydsh/task-projection'
 import { createAppFocusGraph, type AppFocusGraphOptions } from './app-focus.ts'
 import { approvalEvidence } from './approval-evidence.ts'
-import { cycleProjectIndex, resolveReconnectionTask, resolveWorkspaceProjectPermission, selectArtifactChangeAfterMutation, sessionTitleFromProjectionEvent } from './App.tsx'
+import { buildQuestionAnswer, cycleProjectIndex, resolveDisplayedTask, resolveReconnectionTask, resolveWorkspaceProjectPermission, selectArtifactChangeAfterMutation, sessionTitleFromProjectionEvent } from './App.tsx'
 import { aggregateActivityItems } from './TaskInspector.tsx'
 
 const BASE_OPTIONS: AppFocusGraphOptions = {
@@ -65,6 +65,69 @@ describe('审批与权限焦点', () => {
     expect(withoutApproval.nodes.map(node => node.id)).not.toContain('command-approvals')
   })
 
+  it('命令中心分别提供问题与方案审阅入口', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      pendingQuestionCount: 2,
+      pendingPlanReviewCount: 1,
+    })
+
+    expect(graph.nodes.map(node => node.id)).toEqual(expect.arrayContaining([
+      'command-approvals',
+      'command-questions',
+      'command-plan-reviews',
+    ]))
+  })
+
+  it('普通问题详情提供选项、自由文本、取消和安全提交焦点', () => {
+    const unanswered = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      pendingResponseKind: 'question',
+      questionOptionCount: 3,
+      questionAnswered: false,
+      questionHasPrevious: false,
+      questionHasNext: false,
+    })
+    const answered = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      pendingResponseKind: 'question',
+      questionOptionCount: 3,
+      questionAnswered: true,
+      questionHasPrevious: false,
+      questionHasNext: false,
+    })
+
+    expect(unanswered.entryId).toBe('question-option-0')
+    expect(unanswered.nodes.map(node => node.id)).toEqual([
+      'question-back',
+      'question-option-0',
+      'question-option-1',
+      'question-option-2',
+      'question-custom',
+      'question-cancel',
+      'question-skip',
+    ])
+    expect(answered.nodes.map(node => node.id)).toContain('question-submit')
+    expect(answered.nodes.find(node => node.id === 'question-submit')?.neighbors?.left).toBe('question-skip')
+  })
+
+  it('方案审阅默认聚焦拒绝，并保留讨论与批准路径', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      pendingResponseKind: 'plan-review',
+      planReviewHasDecline: true,
+    })
+
+    expect(graph.entryId).toBe('plan-review-decline')
+    expect(graph.nodes.map(node => node.id)).toEqual([
+      'plan-review-back',
+      'plan-review-discuss',
+      'plan-review-decline',
+      'plan-review-approve',
+    ])
+    expect(graph.nodes.find(node => node.id === 'plan-review-decline')?.neighbors?.right).toBe('plan-review-approve')
+  })
+
   it('命令中心提供归档、归档列表和恢复焦点', () => {
     const command = createAppFocusGraph({ ...BASE_OPTIONS, archivedTaskCount: 2 })
     expect(command.nodes.map(node => node.id)).toEqual(expect.arrayContaining([
@@ -115,6 +178,18 @@ describe('审批与权限焦点', () => {
     })
   })
 
+  it('启用完全访问时默认聚焦取消，并可切换到风险确认', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      permissionConfirmationOpen: true,
+    })
+
+    expect(graph.entryId).toBe('permission-cancel')
+    expect(graph.nodes.map(node => node.id)).toEqual(['permission-cancel', 'permission-confirm'])
+    expect(graph.nodes[0]?.neighbors?.right).toBe('permission-confirm')
+    expect(graph.nodes[1]?.neighbors?.left).toBe('permission-cancel')
+  })
+
   it('项目中心的权限选项始终在焦点图内', () => {
     const graph = createAppFocusGraph({
       ...BASE_OPTIONS,
@@ -158,6 +233,19 @@ describe('审批与权限焦点', () => {
 
     expect(graph.entryId).toBe('task-approval-open')
     expect(graph.nodes.map(node => node.id)).toContain('task-approval-open')
+  })
+
+  it('主任务存在问题或方案审阅时把待回应入口置于输入框之前', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      commandCenterOpen: false,
+      pendingApprovalCount: 0,
+      pendingQuestionCount: 1,
+      pendingPlanReviewCount: 1,
+    })
+
+    expect(graph.nodes.map(node => node.id)).toContain('task-response-open')
+    expect(graph.nodes.find(node => node.id === 'task-input')?.neighbors?.up).toBe('task-response-open')
   })
 
   it('命令中心只把可提交成果加入焦点图', () => {
@@ -209,7 +297,60 @@ describe('审批与权限焦点', () => {
   })
 })
 
+describe('结构化问题回答', () => {
+  it('按题型编码选项、自由文本与跳过结果', () => {
+    const request: TaskQuestionRequest = {
+      requestId: 'question-rpc-1',
+      questions: [
+        { id: 'single', question: '单选', options: [{ label: 'A' }, { label: 'B' }] },
+        { id: 'multi', question: '多选', options: [{ label: 'X' }], multiSelect: true },
+        { id: 'skipped', question: '跳过' },
+      ],
+    }
+
+    expect(buildQuestionAnswer(request, {
+      single: { selected: ['A'], custom: '自定义答案', skipped: false },
+      multi: { selected: ['X'], custom: '补充说明', skipped: false },
+      skipped: { selected: [], custom: '', skipped: true },
+    })).toEqual({
+      answers: [
+        { id: 'single', selected: [], custom: '自定义答案' },
+        { id: 'multi', selected: ['X'], custom: '补充说明' },
+        { id: 'skipped', selected: [] },
+      ],
+    })
+  })
+})
+
 describe('任务检查器焦点', () => {
+  it('待发送附件提供预览与移除路径，并连接输入框和工具栏', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      commandCenterOpen: false,
+      pendingApprovalCount: 0,
+      canPauseTask: false,
+      pendingAttachmentIds: ['image-a', 'image-b'],
+    })
+
+    expect(graph.nodes.find(node => node.id === 'task-input')?.neighbors?.down).toBe('attachment-preview-image-a')
+    expect(graph.nodes.find(node => node.id === 'attachment-preview-image-a')?.neighbors?.right).toBe('attachment-remove-image-a')
+    expect(graph.nodes.find(node => node.id === 'attachment-remove-image-a')?.neighbors?.right).toBe('attachment-preview-image-b')
+    expect(graph.nodes.find(node => node.id === 'attachment-remove-image-b')?.neighbors?.down).toBe('voice-input')
+    expect(graph.nodes.find(node => node.id === 'voice-input')?.neighbors?.up).toBe('attachment-remove-image-b')
+  })
+
+  it('图片灯箱默认聚焦关闭，并提供完整缩放焦点链', () => {
+    const graph = createAppFocusGraph({ ...BASE_OPTIONS, lightboxOpen: true })
+    expect(graph.entryId).toBe('lightbox-close')
+    expect(graph.nodes.map(node => node.id)).toEqual([
+      'lightbox-zoom-out',
+      'lightbox-reset',
+      'lightbox-zoom-in',
+      'lightbox-close',
+    ])
+    expect(graph.nodes.find(node => node.id === 'lightbox-close')?.neighbors?.left).toBe('lightbox-zoom-in')
+  })
+
   it('把当前检查器页作为任务区域的下一个焦点区', () => {
     const graph = createAppFocusGraph({
       ...BASE_OPTIONS,
@@ -229,6 +370,23 @@ describe('任务检查器焦点', () => {
       .toBe('inspector-tab-changes')
     expect(graph.nodes.find(node => node.id === 'inspector-file-change-a')?.neighbors?.right)
       .toBe('artifact-accept-change-a')
+  })
+
+  it('检查器隐藏后移除右栏节点，并把空间导航收束到显示按钮', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      commandCenterOpen: false,
+      pendingApprovalCount: 0,
+      inspectorOpen: false,
+      inspectorPage: 'changes',
+      artifactChangeIds: ['change-a'],
+    })
+
+    expect(graph.nodes.map(node => node.id)).toContain('inspector-toggle')
+    expect(graph.nodes.map(node => node.id)).not.toContain('inspector-tab-changes')
+    expect(graph.nodes.map(node => node.id)).not.toContain('inspector-file-change-a')
+    expect(graph.nodes.find(node => node.id === 'task-input')?.neighbors?.right).toBe('inspector-toggle')
+    expect(graph.nodes.find(node => node.id === 'runtime-toggle')?.neighbors?.right).toBe('inspector-toggle')
   })
 
   it('建立输入框、发送按钮、工具栏与检查器标签页之间的双向横向空间导航', () => {
@@ -252,10 +410,10 @@ describe('任务检查器焦点', () => {
     // From Composer / Header to Inspector Tab
     expect(taskInput?.neighbors?.right).toBe('inspector-tab-activity')
     expect(sendTask?.neighbors?.right).toBe('inspector-tab-activity')
-    expect(runtimeToggle?.neighbors?.right).toBe('inspector-tab-activity')
+    expect(runtimeToggle?.neighbors?.right).toBe('inspector-toggle')
 
     // Inside Inspector Tabs
-    expect(tabActivity?.neighbors?.left).toBe('task-input')
+    expect(tabActivity?.neighbors?.left).toBe('inspector-toggle')
     expect(tabActivity?.neighbors?.right).toBe('inspector-tab-changes')
     expect(tabChanges?.neighbors?.left).toBe('inspector-tab-activity')
     expect(tabChanges?.neighbors?.right).toBe('inspector-tab-artifacts')
@@ -324,15 +482,16 @@ describe('PS5 多项目与多会话空间焦点导航', () => {
     expect(pTab0?.neighbors?.down).toBe('session-card-0')
 
     // Session cards vertical sidebar linking
+    const sCardNew = graph.nodes.find(node => node.id === 'session-card-new')
     const sCard0 = graph.nodes.find(node => node.id === 'session-card-0')
     const sCard1 = graph.nodes.find(node => node.id === 'session-card-1')
-    const sCardNew = graph.nodes.find(node => node.id === 'session-card-new')
+    expect(sCardNew?.neighbors?.up).toBe('project-tab-0')
+    expect(sCardNew?.neighbors?.down).toBe('session-card-0')
+    expect(sCard0?.neighbors?.up).toBe('session-card-new')
     expect(sCard0?.neighbors?.down).toBe('session-card-1')
     expect(sCard1?.neighbors?.up).toBe('session-card-0')
-    expect(sCard1?.neighbors?.down).toBe('session-card-new')
-    expect(sCardNew?.neighbors?.up).toBe('session-card-1')
+    expect(sCard1?.neighbors?.down).toBe('task-input')
 
-    expect(sCard0?.neighbors?.up).toBe('project-tab-0')
     expect(sCard0?.neighbors?.right).toBe('task-input')
 
     // Task input points left to active session card in sidebar
@@ -378,6 +537,47 @@ describe('PS5 多项目与多会话空间焦点导航', () => {
     expect(emptyNew?.neighbors?.right).toBe('open-project-center')
   })
 
+  it('新建会话草稿立即进入独立输入区，焦点不再落在现有会话历史里', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      commandCenterOpen: false,
+      pendingApprovalCount: 0,
+      canPauseTask: false,
+      hasActiveTask: true,
+      draftSession: true,
+      projectCount: 2,
+      activeProjectIndex: 0,
+      sessionCount: 2,
+      activeSessionIndex: 0,
+    })
+
+    const nodeIds = graph.nodes.map(node => node.id)
+    expect(nodeIds).toContain('task-input')
+    expect(nodeIds).not.toContain('empty-new-session')
+
+    const inputNode = graph.nodes.find(node => node.id === 'task-input')
+    expect(inputNode?.neighbors?.left).toBe('session-card-new')
+    expect(inputNode?.neighbors?.up).toBe('session-card-new')
+
+    const sCardNew = graph.nodes.find(node => node.id === 'session-card-new')
+    expect(sCardNew?.neighbors?.right).toBe('task-input')
+
+    const pTab0 = graph.nodes.find(node => node.id === 'project-tab-0')
+    expect(pTab0?.neighbors?.down).toBe('session-card-new')
+  })
+
+  it('草稿会话不会回落到现有任务，避免把新输入当成当前历史的续写', () => {
+    const tasks = [
+      { id: 'task-old', workspacePath: '/proj', running: false, blank: false, updatedAt: 1 },
+      { id: 'task-other', workspacePath: '/proj', running: false, blank: false, updatedAt: 2 },
+    ]
+
+    expect(resolveDisplayedTask(tasks, 'task-old', true)).toBeUndefined()
+    expect(resolveDisplayedTask(tasks, undefined, true)).toBeUndefined()
+    expect(resolveDisplayedTask(tasks, 'task-other', false)?.id).toBe('task-other')
+    expect(resolveDisplayedTask(tasks, undefined, false)?.id).toBe('task-old')
+  })
+
   it('L1 / R1 与肩键在多项目间双向循环计算目标索引', () => {
     // 3 projects: 0, 1, 2
     expect(cycleProjectIndex(0, 3, 'next')).toBe(1)
@@ -414,6 +614,24 @@ describe('PS5 多项目与多会话空间焦点导航', () => {
 })
 
 describe('语音输入与设置焦点', () => {
+  it('手柄下拉选择层接管焦点并默认选中当前项', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      settingsOpen: true,
+      gamepadSelectOptionIds: ['gamepad-select-option-0', 'gamepad-select-option-2'],
+      gamepadSelectSelectedId: 'gamepad-select-option-2',
+    })
+
+    expect(graph.entryId).toBe('gamepad-select-option-2')
+    expect(graph.nodes.map(node => node.id)).toEqual([
+      'gamepad-select-close',
+      'gamepad-select-option-0',
+      'gamepad-select-option-2',
+    ])
+    expect(graph.nodes.find(node => node.id === 'gamepad-select-option-2')?.neighbors?.down)
+      .toBe('gamepad-select-close')
+  })
+
   it('主工作区焦点图包含 voice-input 并正确关联输入框与发送按钮', () => {
     const graph = createAppFocusGraph({
       ...BASE_OPTIONS,
@@ -423,23 +641,34 @@ describe('语音输入与设置焦点', () => {
     })
 
     expect(graph.nodes.map(node => node.id)).toContain('voice-input')
+    expect(graph.nodes.map(node => node.id)).toContain('screenshot-button')
+    expect(graph.nodes.map(node => node.id)).toContain('paste-image')
+
     const voiceNode = graph.nodes.find(node => node.id === 'voice-input')
     expect(voiceNode?.neighbors?.left).toBe('pause-task')
-    expect(voiceNode?.neighbors?.right).toBe('attach-image')
+    expect(voiceNode?.neighbors?.right).toBe('screenshot-button')
     expect(voiceNode?.neighbors?.up).toBe('task-input')
+
+    const screenshotNode = graph.nodes.find(node => node.id === 'screenshot-button')
+    expect(screenshotNode?.neighbors?.left).toBe('voice-input')
+    expect(screenshotNode?.neighbors?.right).toBe('paste-image')
+    expect(screenshotNode?.neighbors?.up).toBe('task-input')
+
+    const pasteNode = graph.nodes.find(node => node.id === 'paste-image')
+    expect(pasteNode?.neighbors?.left).toBe('screenshot-button')
+    expect(pasteNode?.neighbors?.right).toBe('send-task')
+    expect(pasteNode?.neighbors?.up).toBe('task-input')
 
     const pauseNode = graph.nodes.find(node => node.id === 'pause-task')
     expect(pauseNode?.neighbors?.right).toBe('voice-input')
 
-    const attachNode = graph.nodes.find(node => node.id === 'attach-image')
-    expect(attachNode?.neighbors?.left).toBe('voice-input')
-    expect(attachNode?.neighbors?.right).toBe('send-task')
+    expect(graph.nodes.map(node => node.id)).not.toContain('attach-image')
 
     const sendNode = graph.nodes.find(node => node.id === 'send-task')
-    expect(sendNode?.neighbors?.left).toBe('attach-image')
+    expect(sendNode?.neighbors?.left).toBe('paste-image')
   })
 
-  it('设置面板焦点图包含语音输入按键、模式与测试项', () => {
+  it('设置面板焦点图包含语音输入按键与测试项，不再重复配置 Spokenly 触发模式', () => {
     const graph = createAppFocusGraph({
       ...BASE_OPTIONS,
       commandCenterOpen: false,
@@ -450,9 +679,23 @@ describe('语音输入与设置焦点', () => {
     expect(graph.nodes.map(node => node.id)).toEqual(expect.arrayContaining([
       'voice-input-gamepad-button',
       'voice-input-key',
-      'voice-input-mode',
       'voice-input-test',
     ]))
+    expect(graph.nodes.map(node => node.id)).not.toContain('voice-input-mode')
+  })
+
+  it('辅助功能未授权时把系统授权入口加入设置焦点图', () => {
+    const graph = createAppFocusGraph({
+      ...BASE_OPTIONS,
+      commandCenterOpen: false,
+      settingsOpen: true,
+      settingsReady: true,
+      voicePermissionActionAvailable: true,
+    })
+
+    const nodeIds = graph.nodes.map(node => node.id)
+    expect(nodeIds).toContain('voice-input-permission')
+    expect(nodeIds.indexOf('voice-input-permission')).toBeLessThan(nodeIds.indexOf('voice-input-test'))
   })
 })
 
@@ -658,7 +901,31 @@ describe('会话历史多回合对话流 (Task Conversation Stream)', () => {
     expect(proj.messages[0]?.id).toBe('task-1:1')
     expect(proj.messages[0]?.content).toBe('运行所有测试')
   })
+
+  it('在多轮任务会话中清理悬挂的流式占位避免残留转圈', () => {
+    let proj = createTaskProjection('task-1')
+    proj = projectTaskEvent(proj, mockEvent('turn/start', 1))
+    expect(proj.messages).toHaveLength(1)
+    expect(proj.messages[0]?.status).toBe('streaming')
+
+    // 收到用户权限指令
+    proj = projectTaskEvent(proj, mockEvent('user/message', 2, { text: '/permission danger-full-access' }))
+    // 助手正常回复权限已设置
+    proj = projectTaskEvent(proj, mockEvent('turn/start', 3))
+    proj = projectTaskEvent(proj, mockEvent('assistant/chunk', 4, { chunk: { type: 'text-delta', text: '已将权限设为 workspace-write' } }))
+    proj = projectTaskEvent(proj, mockEvent('turn/end', 5, { reason: { kind: 'completed' } }))
+
+    // 用户发下一轮消息
+    proj = projectTaskEvent(proj, mockEvent('user/message', 6, { text: '新问题' }))
+
+    expect(proj.messages).toHaveLength(3)
+    expect(proj.messages[0]?.content).toBe('/permission danger-full-access')
+    expect(proj.messages[1]?.content).toBe('已将权限设为 workspace-write')
+    expect(proj.messages[1]?.status).toBe('completed')
+    expect(proj.messages[2]?.content).toBe('新问题')
+  })
 })
+
 
 
 function mockEvent(type: string, sequence: number, data: unknown = {}, kind: TaskEvent['kind'] = 'session'): TaskEvent {
@@ -694,4 +961,3 @@ function artifactChange(changeId: string): TaskFileChange {
     diff: { kind: 'binary' },
   }
 }
-

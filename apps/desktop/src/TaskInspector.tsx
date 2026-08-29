@@ -58,7 +58,7 @@ export function TaskInspector({
   const activityItems = useMemo(() => aggregateActivityItems(events), [events])
 
   return (
-    <section className="events-panel task-inspector" aria-label="任务检查器" aria-busy={loading}>
+    <section id="task-inspector" className="events-panel task-inspector" aria-label="任务检查器" aria-busy={loading}>
       <header className="inspector-header">
         <div className="inspector-tabs" role="tablist" aria-label="任务检查器页面">
           {INSPECTOR_PAGES.map(item => (

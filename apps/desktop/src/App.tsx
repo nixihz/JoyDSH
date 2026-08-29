@@ -10,6 +10,9 @@ import type {
   TaskEvent,
   TaskFileChange,
   TaskPermissionMode,
+  TaskPlanReview,
+  TaskQuestionAnswer,
+  TaskQuestionRequest,
   TaskSession,
 } from '@joydsh/domain'
 import type { CredentialStatus, ModelSelection } from '@joydsh/dsh-adapter'
@@ -24,13 +27,19 @@ import {
   Archive,
   ArchiveRestore,
   ArrowLeft,
+  Camera,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Circle,
+  CircleHelp,
   CirclePause,
+  ClipboardPaste,
   Eye,
   EyeOff,
   Folder,
   FolderKanban,
+  FileCheck2,
   GitCommitHorizontal,
   Image as ImageIcon,
   Layers3,
@@ -39,6 +48,8 @@ import {
   Maximize,
   Mic,
   Minimize,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
   Power,
   RefreshCw,
@@ -55,12 +66,15 @@ import {
   loadVoiceInputConfig,
   saveVoiceInputConfig,
   simulateKeyAction,
+  checkKeySimulationSupport,
+  requestKeySimulationPermission,
   GAMEPAD_BUTTON_OPTIONS,
   TARGET_KEY_OPTIONS,
+  gamepadButtonConflict,
   type VoiceInputConfig,
   type VoiceInputGamepadButton,
-  type VoiceInputMode,
   type VoiceInputTargetKey,
+  type KeySimulationCapabilities,
 } from './voice-input-service.ts'
 import { createRuntimeAdapter } from './dsh-transport.ts'
 import { createAppFocusGraph } from './app-focus.ts'
@@ -98,6 +112,14 @@ import { ImageLightbox, type LightboxImage } from './ImageLightbox.tsx'
 import { AttachmentRail } from './AttachmentRail.tsx'
 import { MessageImages } from './MessageImages.tsx'
 import {
+  applyGamepadSelectChoice,
+  createGamepadSelectSession,
+  GamepadSelectOverlay,
+  type GamepadSelectSession,
+} from './GamepadSelectOverlay.tsx'
+import { captureScreenImage, dataUrlToBlob, readImageFromClipboard, writeImageToClipboard } from './screenshot-service.ts'
+import { collectPendingResponses } from './pending-responses.ts'
+import {
   archiveTask,
   archivedTasks,
   loadTaskArchiveState,
@@ -107,8 +129,11 @@ import {
 } from './task-archive-service.ts'
 
 const DSH_VERSION = '0.1.1-rc.2'
+const NON_TEXT_INPUT_TYPES = new Set(['button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'])
 const MAX_VISIBLE_EVENTS = 2000
 const EMPTY_APPROVALS: readonly TaskApproval[] = []
+const EMPTY_QUESTIONS: readonly TaskQuestionRequest[] = []
+const EMPTY_PLAN_REVIEWS: readonly TaskPlanReview[] = []
 const INSPECTOR_PAGES: readonly InspectorPage[] = ['activity', 'changes', 'artifacts']
 const PROVIDERS = {
   'deepseek-official': {
@@ -124,6 +149,38 @@ const PROVIDERS = {
 } as const
 
 type ModelProvider = keyof typeof PROVIDERS
+
+interface QuestionDraft {
+  selected: string[]
+  custom: string
+  skipped: boolean
+}
+
+type QuestionDrafts = Record<string, QuestionDraft>
+
+type PendingResponseSelection =
+  | { kind: 'question', taskId: string, requestId: string }
+  | { kind: 'plan-review', taskId: string, requestId: string }
+
+interface PendingApprovalSelection {
+  taskId: string
+  approvalId: string
+}
+
+export function buildQuestionAnswer(request: TaskQuestionRequest, drafts: QuestionDrafts): TaskQuestionAnswer {
+  return {
+    answers: request.questions.map(question => {
+      const draft = drafts[question.id] ?? { selected: [], custom: '', skipped: true }
+      if (draft.skipped) return { id: question.id, selected: [] }
+      const custom = draft.custom.trim()
+      return {
+        id: question.id,
+        selected: custom !== '' && question.multiSelect !== true ? [] : draft.selected,
+        ...(custom === '' ? {} : { custom }),
+      }
+    }),
+  }
+}
 
 type ArtifactConfirmation =
   | { kind: 'reject-file'; changeId: string; path: string; returnTo: 'inspector' }
@@ -147,7 +204,14 @@ export function App() {
   const [archiveViewOpen, setArchiveViewOpen] = useState(false)
   const [projections, setProjections] = useState<Record<string, TaskProjection>>({})
   const [activeTaskId, setActiveTaskId] = useState<string | undefined>()
+  const [composingNewSession, setComposingNewSession] = useState(false)
+  const composingNewSessionRef = useRef(false)
+  const updateComposingNewSession = useCallback((value: boolean) => {
+    composingNewSessionRef.current = value
+    setComposingNewSession(value)
+  }, [])
   const [inspectorPage, setInspectorPage] = useState<InspectorPage>('activity')
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [artifactBaseline, setArtifactBaseline] = useState<TaskArtifactBaseline | undefined>()
   const [artifactSnapshot, setArtifactSnapshot] = useState<TaskArtifactSnapshot | undefined>()
   const [artifactsLoading, setArtifactsLoading] = useState(false)
@@ -157,18 +221,27 @@ export function App() {
   const [artifactConfirmation, setArtifactConfirmation] = useState<ArtifactConfirmation | undefined>()
   const [artifactCommitFlow, setArtifactCommitFlow] = useState<ArtifactCommitFlow | undefined>()
   const [busy, setBusy] = useState(false)
+  const [sendBusy, setSendBusy] = useState(false)
   const [error, setError] = useState<string | undefined>()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [commandCenterOpen, setCommandCenterOpen] = useState(false)
+  const [permissionConfirmationOpen, setPermissionConfirmationOpen] = useState(false)
+  const [permissionChangeBusy, setPermissionChangeBusy] = useState(false)
+  const [permissionChangeError, setPermissionChangeError] = useState<string | undefined>()
   const [projectCenterOpen, setProjectCenterOpen] = useState(false)
   const [workspaceCatalog, setWorkspaceCatalog] = useState<WorkspaceCatalog>({ projects: [] })
   const [projectName, setProjectName] = useState('')
   const [projectPermissionMode, setProjectPermissionMode] = useState<WorkspacePermissionMode>('standard')
   const [projectBusy, setProjectBusy] = useState(false)
   const [projectError, setProjectError] = useState<string | undefined>()
-  const [selectedApprovalId, setSelectedApprovalId] = useState<string | undefined>()
+  const [selectedApprovalSelection, setSelectedApprovalSelection] = useState<PendingApprovalSelection | undefined>()
   const [approvalRespondingId, setApprovalRespondingId] = useState<string | undefined>()
   const [approvalError, setApprovalError] = useState<string | undefined>()
+  const [selectedPendingResponse, setSelectedPendingResponse] = useState<PendingResponseSelection | undefined>()
+  const [questionIndex, setQuestionIndex] = useState(0)
+  const [questionDrafts, setQuestionDrafts] = useState<QuestionDrafts>({})
+  const [responseBusy, setResponseBusy] = useState(false)
+  const [responseError, setResponseError] = useState<string | undefined>()
   const [selectedProvider, setSelectedProvider] = useState<ModelProvider>('deepseek-official')
   const [selectedModel, setSelectedModel] = useState<string>(PROVIDERS.openai.defaultModel)
   const [credentialStatuses, setCredentialStatuses] = useState<Partial<Record<ModelProvider, CredentialStatus>>>({})
@@ -183,25 +256,59 @@ export function App() {
   const [settingsMessage, setSettingsMessage] = useState<string | undefined>()
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [voiceConfig, setVoiceConfig] = useState<VoiceInputConfig>(loadVoiceInputConfig)
-  const [isVoiceActive, setIsVoiceActive] = useState(false)
+  const [isVoicePressed, setIsVoicePressed] = useState(false)
   const [voiceTestStatus, setVoiceTestStatus] = useState<string | undefined>()
+  const [voiceCapabilities, setVoiceCapabilities] = useState<KeySimulationCapabilities | undefined>()
+  const [voicePermissionBusy, setVoicePermissionBusy] = useState(false)
   const [pendingImages, setPendingImages] = useState<ImageAttachmentInput[]>([])
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null)
+  const [screenshotBusy, setScreenshotBusy] = useState(false)
+  const [gamepadSelect, setGamepadSelect] = useState<GamepadSelectSession | null>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const voiceActionQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const pressedVoiceTargetRef = useRef<Pick<VoiceInputConfig, 'targetKey' | 'customKeyCode'> | null>(null)
   const lightboxReturnFocusRef = useRef<HTMLElement | null>(null)
   const settingsReturnFocusRef = useRef('settings-toggle')
   const commandReturnFocusRef = useRef('settings-toggle')
   const projectReturnFocusRef = useRef('settings-toggle')
   const approvalReturnFocusRef = useRef('command-approvals')
+  const responseReturnFocusRef = useRef('command-questions')
   const approvalAttemptRef = useRef(0)
+  const responseAttemptRef = useRef(0)
   const artifactAttemptRef = useRef(0)
+  const gamepadSelectReturnFocusRef = useRef<string | undefined>(undefined)
+
+  const refreshVoiceCapabilities = useCallback(async () => {
+    const capabilities = await checkKeySimulationSupport()
+    setVoiceCapabilities(capabilities)
+    return capabilities
+  }, [])
   const commitAttemptRef = useRef(0)
   const previousArtifactStatusRef = useRef<TaskProjection['status'] | undefined>(undefined)
   const taskSelectionRef = useRef(createLatestSelection())
   const projectTrackRef = useRef<HTMLDivElement>(null)
   const sessionTrackRef = useRef<HTMLDivElement>(null)
   const outputSurfaceRef = useRef<HTMLDivElement>(null)
+
+  const closeGamepadSelect = useCallback(() => {
+    setGamepadSelect(null)
+    const returnFocusId = gamepadSelectReturnFocusRef.current
+    gamepadSelectReturnFocusRef.current = undefined
+    if (returnFocusId !== undefined) restoreManagedFocus(returnFocusId)
+  }, [])
+
+  const openGamepadSelect = useCallback((select: HTMLSelectElement) => {
+    const session = createGamepadSelectSession(select)
+    if (session.choices.length === 0) return
+    gamepadSelectReturnFocusRef.current = session.focusId
+    setGamepadSelect(session)
+  }, [])
+
+  const chooseGamepadSelectOption = useCallback((optionIndex: number) => {
+    if (gamepadSelect === null) return
+    applyGamepadSelectChoice(gamepadSelect, optionIndex)
+    closeGamepadSelect()
+  }, [closeGamepadSelect, gamepadSelect])
 
   const projects = workspaceCatalog.projects
   const activeProject = projects.find(project => project.path === workspacePath)
@@ -212,19 +319,48 @@ export function App() {
     return visibleTaskList.filter(t => t.workspacePath === workspacePath || (!t.workspacePath && !workspacePath))
   }, [visibleTaskList, workspacePath])
   const activeTask = useMemo(() => {
-    return currentProjectTasks.find(t => t.id === activeTaskId)
-      ?? currentProjectTasks[0]
-  }, [activeTaskId, currentProjectTasks])
+    return resolveDisplayedTask(currentProjectTasks, activeTaskId, composingNewSession)
+  }, [activeTaskId, composingNewSession, currentProjectTasks])
   const activeSessionIndex = activeTask ? currentProjectTasks.findIndex(t => t.id === activeTask.id) : 0
   const projection = activeTask ? (projections[activeTask.id] ?? createTaskProjection(activeTask.id)) : undefined
 
   const pendingApprovals = projection?.pendingApprovals ?? EMPTY_APPROVALS
-  const selectedApproval = selectedApprovalId === undefined
+  const pendingQuestions = projection?.pendingQuestions ?? EMPTY_QUESTIONS
+  const pendingPlanReviews = projection?.pendingPlanReviews ?? EMPTY_PLAN_REVIEWS
+  const pendingResponseQueue = useMemo(() => collectPendingResponses(
+    visibleTaskList.map(task => task.id),
+    projections,
+    activeTask?.id,
+  ), [activeTask?.id, projections, visibleTaskList])
+  const allPendingApprovals = pendingResponseQueue.approvals
+  const allPendingQuestions = pendingResponseQueue.questions
+  const allPendingPlanReviews = pendingResponseQueue.planReviews
+  const selectedTaskProjection = selectedApprovalSelection === undefined
     ? undefined
-    : pendingApprovals.find(approval => approval.approvalId === selectedApprovalId)
+    : projections[selectedApprovalSelection.taskId]
+  const selectedApproval = selectedApprovalSelection === undefined
+    ? undefined
+    : selectedTaskProjection?.pendingApprovals.find(approval => approval.approvalId === selectedApprovalSelection.approvalId)
+  const selectedResponseProjection = selectedPendingResponse === undefined
+    ? undefined
+    : projections[selectedPendingResponse.taskId]
+  const selectedQuestionRequest = selectedPendingResponse?.kind === 'question'
+    ? selectedResponseProjection?.pendingQuestions.find(request => request.requestId === selectedPendingResponse.requestId)
+    : undefined
+  const selectedPlanReview = selectedPendingResponse?.kind === 'plan-review'
+    ? selectedResponseProjection?.pendingPlanReviews.find(review => review.requestId === selectedPendingResponse.requestId)
+    : undefined
+  const selectedQuestion = selectedQuestionRequest?.questions[questionIndex]
+  const selectedQuestionDraft = selectedQuestion === undefined
+    ? undefined
+    : questionDrafts[selectedQuestion.id] ?? { selected: [], custom: '', skipped: false }
+  const selectedQuestionAnswered = selectedQuestionDraft !== undefined
+    && (selectedQuestionDraft.selected.length > 0 || selectedQuestionDraft.custom.trim() !== '')
   const activePermissionMode = projection?.permissionMode ?? projectPermissionMode
   const selectedArtifactChange = artifactSnapshot?.changes.find(change => change.changeId === selectedArtifactChangeId)
-  const artifactExecutionActive = projection?.status === 'running' || projection?.status === 'waiting-approval'
+  const artifactExecutionActive = projection?.status === 'running'
+    || projection?.status === 'waiting-approval'
+    || projection?.status === 'waiting-response'
   const canReviewArtifacts = artifactSnapshot?.availability === 'ready'
     && artifactSnapshot.mutation.availability === 'ready'
     && !artifactExecutionActive
@@ -243,7 +379,17 @@ export function App() {
   )
   const conversationMessages = useMemo(() => {
     if (!projection?.messages || projection.messages.length === 0) return []
-    return projection.messages.filter(msg => !msg.isSystemInjection)
+    return projection.messages.filter((msg, index, all) => {
+      if (msg.isSystemInjection) return false
+      const isLatest = index === all.length - 1
+      if (!isLatest && msg.role === 'assistant') {
+        const hasContent = Boolean(msg.content && msg.content.trim() !== '')
+        const hasImages = Boolean(msg.images && msg.images.length > 0)
+        const hasFailure = msg.failure !== undefined
+        if (!hasContent && !hasImages && !hasFailure) return false
+      }
+      return true
+    })
   }, [projection?.messages])
 
   const appendEvent = useCallback((event: TaskEvent) => {
@@ -343,10 +489,12 @@ export function App() {
   }, [])
 
   const restoreTask = useCallback(async (task: TaskSession) => {
+    if (composingNewSessionRef.current) return undefined
     const selection = taskSelectionRef.current.begin()
     commitAttemptRef.current += 1
     setArtifactCommitFlow(undefined)
     setActiveTaskId(task.id)
+    setError(undefined)
     const effectivePath = task.workspacePath || workspacePath
     if (task.workspacePath && task.workspacePath !== workspacePath) {
       setWorkspacePath(task.workspacePath)
@@ -363,17 +511,30 @@ export function App() {
       ...createTaskProjection(task.id),
       permissionMode: targetPermission,
     }
-    const history = await adapter.replayTask(task.id)
-    const restored = synchronizeTaskRunning(
-      history.reduce(projectTaskEvent, initialProj),
-      task.running,
-    )
-    const finalProj = { ...restored, events: restored.events.slice(-MAX_VISIBLE_EVENTS) }
-    if (!taskSelectionRef.current.isCurrent(selection)) return finalProj
-    setProjections(current => ({ ...current, [task.id]: finalProj }))
-    setProjectPermissionMode(finalProj.permissionMode)
-    await loadTaskArtifacts(task, false)
-    return finalProj
+    try {
+      const history = await adapter.replayTask(task.id)
+      const restored = synchronizeTaskRunning(
+        history.reduce(projectTaskEvent, initialProj),
+        task.running,
+      )
+      const finalProj = { ...restored, events: restored.events.slice(-MAX_VISIBLE_EVENTS) }
+      if (!taskSelectionRef.current.isCurrent(selection)) return finalProj
+      setProjections(current => ({ ...current, [task.id]: finalProj }))
+      setProjectPermissionMode(finalProj.permissionMode)
+      await loadTaskArtifacts(task, false)
+      return finalProj
+    } catch (cause) {
+      if (!taskSelectionRef.current.isCurrent(selection)) return initialProj
+      const message = errorMessage(cause)
+      setError(message)
+      const fallbackProj = {
+        ...initialProj,
+        status: 'failed' as const,
+        failure: { message },
+      }
+      setProjections(current => ({ ...current, [task.id]: fallbackProj }))
+      return fallbackProj
+    }
   }, [adapter, loadTaskArtifacts, projectPermissionMode, workspaceCatalog.projects, workspacePath])
 
   const reconnect = useCallback(async (reportError = true): Promise<boolean> => {
@@ -385,7 +546,7 @@ export function App() {
       setAllTasks(listed)
       const visible = visibleTasks(listed, taskArchiveState)
       const current = resolveReconnectionTask(visible, workspacePath)
-      if (current !== undefined) await restoreTask(current)
+      if (current !== undefined && !composingNewSessionRef.current) await restoreTask(current)
       return true
     } catch (cause) {
       setConnection('disconnected')
@@ -431,6 +592,13 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    void refreshVoiceCapabilities()
+    const refreshAfterSystemSettings = () => void refreshVoiceCapabilities()
+    window.addEventListener('focus', refreshAfterSystemSettings)
+    return () => window.removeEventListener('focus', refreshAfterSystemSettings)
+  }, [refreshVoiceCapabilities])
+
+  useEffect(() => {
     if (outputSurfaceRef.current) {
       outputSurfaceRef.current.scrollTop = outputSurfaceRef.current.scrollHeight
     }
@@ -464,6 +632,7 @@ export function App() {
     setSettingsError(undefined)
     setSettingsMessage(undefined)
     setSettingsBusy(true)
+    void refreshVoiceCapabilities()
     void Promise.all([
       adapter.describeCredential(PROVIDERS['deepseek-official'].credentialRef),
       adapter.describeCredential(PROVIDERS.openai.credentialRef),
@@ -475,7 +644,7 @@ export function App() {
       })
       .catch(cause => setSettingsError(errorMessage(cause)))
       .finally(() => setSettingsBusy(false))
-  }, [adapter])
+  }, [adapter, refreshVoiceCapabilities])
 
   const openSettings = useCallback(() => {
     if (document.activeElement instanceof HTMLElement) {
@@ -485,31 +654,40 @@ export function App() {
   }, [loadSettings])
 
   const closeCommandCenter = useCallback(() => {
-    if (artifactMutationBusy || artifactCommitFlow?.phase === 'committing') return
+    if (permissionChangeBusy || artifactMutationBusy || responseBusy || artifactCommitFlow?.phase === 'committing') return
     approvalAttemptRef.current += 1
     commitAttemptRef.current += 1
     setCommandCenterOpen(false)
     setArchiveViewOpen(false)
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
+    responseAttemptRef.current += 1
+    setSelectedPendingResponse(undefined)
+    setQuestionIndex(0)
+    setQuestionDrafts({})
+    setResponseBusy(false)
+    setResponseError(undefined)
     setArtifactConfirmation(undefined)
     setArtifactCommitFlow(undefined)
     setArtifactMutationError(undefined)
+    setPermissionConfirmationOpen(false)
+    setPermissionChangeError(undefined)
     restoreManagedFocus(commandReturnFocusRef.current)
-  }, [artifactCommitFlow?.phase, artifactMutationBusy])
+  }, [artifactCommitFlow?.phase, artifactMutationBusy, permissionChangeBusy, responseBusy])
 
   const closeApprovalDetail = useCallback(() => {
     approvalAttemptRef.current += 1
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
-    restoreManagedFocus(pendingApprovals.length > 0 ? approvalReturnFocusRef.current : 'command-current-task')
-  }, [pendingApprovals.length])
+    restoreManagedFocus(allPendingApprovals.length > 0 ? approvalReturnFocusRef.current : 'command-current-task')
+  }, [allPendingApprovals.length])
 
   const openApprovalDetail = useCallback(() => {
-    const approval = pendingApprovals[0]
-    if (approval === undefined) return
+    const pending = allPendingApprovals[0]
+    if (pending === undefined) return
+    const approval = pending.item
     if (document.activeElement instanceof HTMLElement) {
       approvalReturnFocusRef.current = document.activeElement.dataset.focusId ?? 'command-approvals'
     }
@@ -518,23 +696,151 @@ export function App() {
     commitAttemptRef.current += 1
     setArtifactCommitFlow(undefined)
     setArtifactMutationError(undefined)
+    setPermissionConfirmationOpen(false)
+    setPermissionChangeError(undefined)
     setCommandCenterOpen(true)
-    setSelectedApprovalId(approval.approvalId)
-  }, [pendingApprovals])
+    setSelectedApprovalSelection({ taskId: pending.taskId, approvalId: approval.approvalId })
+  }, [allPendingApprovals])
 
   const respondToSelectedApproval = useCallback((outcome: TaskApprovalOutcome) => {
-    if (activeTask === undefined || selectedApproval === undefined || approvalRespondingId !== undefined) return
+    if (selectedApprovalSelection === undefined || selectedApproval === undefined || approvalRespondingId !== undefined) return
     const attempt = approvalAttemptRef.current + 1
     approvalAttemptRef.current = attempt
     setApprovalError(undefined)
     setApprovalRespondingId(selectedApproval.approvalId)
-    void adapter.respondToApproval(activeTask.id, selectedApproval, outcome)
+    void adapter.respondToApproval(selectedApprovalSelection.taskId, selectedApproval, outcome)
       .catch(cause => {
         if (approvalAttemptRef.current !== attempt) return
         setApprovalRespondingId(undefined)
         setApprovalError(errorMessage(cause))
       })
-  }, [activeTask, adapter, approvalRespondingId, selectedApproval])
+  }, [adapter, approvalRespondingId, selectedApproval, selectedApprovalSelection])
+
+  const closePendingResponseDetail = useCallback(() => {
+    if (responseBusy) return
+    responseAttemptRef.current += 1
+    setSelectedPendingResponse(undefined)
+    setQuestionIndex(0)
+    setQuestionDrafts({})
+    setResponseError(undefined)
+    restoreManagedFocus(responseReturnFocusRef.current)
+  }, [responseBusy])
+
+  const openQuestionDetail = useCallback(() => {
+    const pending = allPendingQuestions[0]
+    if (pending === undefined) return
+    const request = pending.item
+    if (document.activeElement instanceof HTMLElement) {
+      responseReturnFocusRef.current = document.activeElement.dataset.focusId ?? 'command-questions'
+    }
+    setSelectedApprovalSelection(undefined)
+    setSelectedPendingResponse({ kind: 'question', taskId: pending.taskId, requestId: request.requestId })
+    setQuestionIndex(0)
+    setQuestionDrafts(Object.fromEntries(request.questions.map(question => [question.id, {
+      selected: [],
+      custom: '',
+      skipped: false,
+    }])))
+    setResponseBusy(false)
+    setResponseError(undefined)
+    setCommandCenterOpen(true)
+  }, [allPendingQuestions])
+
+  const openPlanReviewDetail = useCallback(() => {
+    const pending = allPendingPlanReviews[0]
+    if (pending === undefined) return
+    const review = pending.item
+    if (document.activeElement instanceof HTMLElement) {
+      responseReturnFocusRef.current = document.activeElement.dataset.focusId ?? 'command-plan-reviews'
+    }
+    setSelectedApprovalSelection(undefined)
+    setSelectedPendingResponse({ kind: 'plan-review', taskId: pending.taskId, requestId: review.requestId })
+    setResponseBusy(false)
+    setResponseError(undefined)
+    setCommandCenterOpen(true)
+  }, [allPendingPlanReviews])
+
+  const settlePendingResponse = useCallback((operation: () => Promise<void>) => {
+    if (responseBusy) return
+    const attempt = responseAttemptRef.current + 1
+    responseAttemptRef.current = attempt
+    setResponseBusy(true)
+    setResponseError(undefined)
+    void operation().catch(cause => {
+      if (responseAttemptRef.current !== attempt) return
+      setResponseBusy(false)
+      setResponseError(errorMessage(cause))
+    })
+  }, [responseBusy])
+
+  const submitQuestionRequest = useCallback((drafts: QuestionDrafts) => {
+    if (selectedPendingResponse?.kind !== 'question' || selectedQuestionRequest === undefined) return
+    const answer = buildQuestionAnswer(selectedQuestionRequest, drafts)
+    settlePendingResponse(() => adapter.respondToQuestion(selectedPendingResponse.taskId, selectedQuestionRequest.requestId, answer))
+  }, [adapter, selectedPendingResponse, selectedQuestionRequest, settlePendingResponse])
+
+  const updateSelectedQuestionOption = useCallback((label: string) => {
+    if (selectedQuestion === undefined) return
+    setQuestionDrafts(current => {
+      const draft = current[selectedQuestion.id] ?? { selected: [], custom: '', skipped: false }
+      const selected = selectedQuestion.multiSelect === true
+        ? draft.selected.includes(label)
+          ? draft.selected.filter(value => value !== label)
+          : [...draft.selected, label]
+        : [label]
+      return {
+        ...current,
+        [selectedQuestion.id]: {
+          ...draft,
+          selected,
+          ...(selectedQuestion.multiSelect === true ? {} : { custom: '' }),
+          skipped: false,
+        },
+      }
+    })
+  }, [selectedQuestion])
+
+  const updateSelectedQuestionCustom = useCallback((custom: string) => {
+    if (selectedQuestion === undefined) return
+    setQuestionDrafts(current => ({
+      ...current,
+      [selectedQuestion.id]: {
+        ...(current[selectedQuestion.id] ?? { selected: [], custom: '', skipped: false }),
+        custom,
+        skipped: false,
+      },
+    }))
+  }, [selectedQuestion])
+
+  const advanceQuestion = useCallback((skip: boolean) => {
+    if (selectedQuestionRequest === undefined || selectedQuestion === undefined) return
+    const nextDrafts = skip
+      ? {
+          ...questionDrafts,
+          [selectedQuestion.id]: { selected: [], custom: '', skipped: true },
+        }
+      : questionDrafts
+    if (questionIndex < selectedQuestionRequest.questions.length - 1) {
+      setQuestionDrafts(nextDrafts)
+      setQuestionIndex(current => current + 1)
+      restoreManagedFocus('question-option-0')
+      return
+    }
+    submitQuestionRequest(nextDrafts)
+  }, [questionDrafts, questionIndex, selectedQuestion, selectedQuestionRequest, submitQuestionRequest])
+
+  const cancelPendingResponse = useCallback(() => {
+    const requestId = selectedPendingResponse?.requestId
+    if (requestId === undefined) return
+    settlePendingResponse(() => adapter.cancelQuestion(requestId))
+  }, [adapter, selectedPendingResponse?.requestId, settlePendingResponse])
+
+  const decidePlanReview = useCallback((label: string) => {
+    if (selectedPendingResponse?.kind !== 'plan-review' || selectedPlanReview === undefined) return
+    settlePendingResponse(() => adapter.respondToQuestion(selectedPendingResponse.taskId, selectedPlanReview.requestId, {
+      answers: [{ id: selectedPlanReview.id, selected: [label] }],
+    }))
+  }, [adapter, selectedPendingResponse, selectedPlanReview, settlePendingResponse])
 
   const toggleCommandCenter = useCallback(() => {
     if (settingsOpen || projectCenterOpen) return
@@ -553,24 +859,38 @@ export function App() {
   }, [closeCommandCenter, commandCenterOpen, projectCenterOpen, settingsOpen])
 
   useEffect(() => {
-    if (selectedApprovalId === undefined || selectedApproval !== undefined) return
+    if (selectedApprovalSelection === undefined || selectedApproval !== undefined) return
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
-    const nextApproval = pendingApprovals[0]
-    if (nextApproval !== undefined) {
-      setSelectedApprovalId(nextApproval.approvalId)
+    const next = allPendingApprovals[0]
+    if (next !== undefined) {
+      setSelectedApprovalSelection({ taskId: next.taskId, approvalId: next.item.approvalId })
       restoreManagedFocus('approval-reject')
       return
     }
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     restoreManagedFocus(commandCenterOpen ? 'command-current-task' : commandReturnFocusRef.current)
-  }, [commandCenterOpen, pendingApprovals, selectedApproval, selectedApprovalId])
+  }, [allPendingApprovals, commandCenterOpen, selectedApproval, selectedApprovalSelection])
+
+  useEffect(() => {
+    if (selectedPendingResponse === undefined) return
+    const stillPending = selectedPendingResponse.kind === 'question'
+      ? selectedQuestionRequest !== undefined
+      : selectedPlanReview !== undefined
+    if (stillPending) return
+    setResponseBusy(false)
+    setResponseError(undefined)
+    setSelectedPendingResponse(undefined)
+    setQuestionIndex(0)
+    setQuestionDrafts({})
+    restoreManagedFocus(commandCenterOpen ? 'command-current-task' : commandReturnFocusRef.current)
+  }, [commandCenterOpen, selectedPendingResponse, selectedPlanReview, selectedQuestionRequest])
 
   const openSettingsFromCommand = useCallback(() => {
     approvalAttemptRef.current += 1
     settingsReturnFocusRef.current = commandReturnFocusRef.current
     setCommandCenterOpen(false)
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
     commitAttemptRef.current += 1
@@ -595,7 +915,7 @@ export function App() {
     taskSelectionRef.current.invalidate()
     setCommandCenterOpen(false)
     setSettingsOpen(false)
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setApprovalRespondingId(undefined)
     setApprovalError(undefined)
     commitAttemptRef.current += 1
@@ -646,6 +966,7 @@ export function App() {
   }, [adapter])
 
   const activateWorkspace = useCallback(async (path: string, permissionMode: TaskPermissionMode) => {
+    updateComposingNewSession(false)
     setWorkspacePath(path)
     setProjectPermissionMode(permissionMode)
     await ensureRuntimeReady(path)
@@ -655,17 +976,11 @@ export function App() {
     const existing = visible.find(task => task.workspacePath === path)
     let task: TaskSession
     if (existing !== undefined) {
-      const restored = await restoreTask(existing)
+      await restoreTask(existing)
       task = existing
-      if (permissionMode === 'full-access' || restored.permissionMode !== permissionMode) {
-        await adapter.setTaskPermission(task.id, permissionMode)
-        setProjections(current => {
-          const prev = current[task.id] ?? createTaskProjection(task.id)
-          return { ...current, [task.id]: { ...prev, permissionMode } }
-        })
-      }
     } else {
       task = await adapter.createTask({ workspacePath: path })
+      await adapter.setTaskPermission(task.id, permissionMode)
       setAllTasks(current => [task, ...current.filter(t => t.id !== task.id)])
       setActiveTaskId(task.id)
       setProjections(current => ({
@@ -676,15 +991,15 @@ export function App() {
       setArtifactSnapshot(undefined)
       setSelectedArtifactChangeId(undefined)
       setArtifactCommitFlow(undefined)
+      setTaskInput('')
+      setPendingImages([])
+      setError(undefined)
       await loadTaskArtifacts(task, true)
-      if (permissionMode === 'full-access') {
-        await adapter.setTaskPermission(task.id, permissionMode)
-      }
     }
     setProjectCenterOpen(false)
     setProjectName('')
     restoreManagedFocus('task-input')
-  }, [adapter, ensureRuntimeReady, loadTaskArtifacts, restoreTask, taskArchiveState])
+  }, [adapter, ensureRuntimeReady, loadTaskArtifacts, restoreTask, taskArchiveState, updateComposingNewSession])
 
   const runProject = useCallback(async (operation: () => Promise<void>) => {
     setProjectBusy(true)
@@ -732,20 +1047,11 @@ export function App() {
     if (path === workspacePath) {
       setProjectPermissionMode(permissionMode)
     }
-    const task = activeTask?.workspacePath === path
-      ? activeTask
-      : allTasks.find(candidate => candidate.workspacePath === path)
-    if (task !== undefined) {
-      setProjections(current => {
-        const prev = current[task.id] ?? createTaskProjection(task.id)
-        return { ...current, [task.id]: { ...prev, permissionMode } }
-      })
-      await adapter.setTaskPermission(task.id, permissionMode)
-    }
   })
 
   const handleSelectProject = useCallback((path: string) => {
     if (path === workspacePath) return
+    updateComposingNewSession(false)
     taskSelectionRef.current.invalidate()
     artifactAttemptRef.current += 1
     setWorkspacePath(path)
@@ -757,7 +1063,8 @@ export function App() {
     if (projectIndex >= 0) {
       restoreManagedFocus(`project-tab-${projectIndex}`)
     }
-    const projectTasks = allTasks.filter(t => t.workspacePath === path)
+    const visible = visibleTasks(allTasks, taskArchiveState)
+    const projectTasks = visible.filter(t => t.workspacePath === path)
     const proj = workspaceCatalog.projects.find(p => p.path === path)
     const mode = proj?.permissionMode ?? projectPermissionMode
     setProjectPermissionMode(mode)
@@ -765,7 +1072,7 @@ export function App() {
       const first = projectTasks[0]
       if (first !== undefined) void restoreTask(first)
     }
-  }, [allTasks, projectPermissionMode, restoreTask, workspaceCatalog.projects, workspacePath])
+  }, [allTasks, projectPermissionMode, restoreTask, taskArchiveState, updateComposingNewSession, workspaceCatalog.projects, workspacePath])
 
   const handlePreviousProject = useCallback(() => {
     const projectList = workspaceCatalog.projects
@@ -786,14 +1093,18 @@ export function App() {
   }, [handleSelectProject, workspaceCatalog.projects, workspacePath])
 
   const handleSelectSession = useCallback((taskId: string) => {
-    if (taskId === activeTaskId) return
+    if (taskId === activeTaskId && !composingNewSession) return
+    updateComposingNewSession(false)
+    setTaskInput('')
+    setPendingImages([])
+    setError(undefined)
     const sessionIndex = currentProjectTasks.findIndex(candidate => candidate.id === taskId)
     if (sessionIndex >= 0) {
       restoreManagedFocus(`session-card-${sessionIndex}`)
     }
     const task = currentProjectTasks.find(candidate => candidate.id === taskId)
     if (task !== undefined) void restoreTask(task)
-  }, [activeTaskId, currentProjectTasks, restoreTask])
+  }, [activeTaskId, composingNewSession, currentProjectTasks, restoreTask, updateComposingNewSession])
 
   const handleHorizontalWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     const track = event.currentTarget
@@ -819,7 +1130,11 @@ export function App() {
   }, [activeTask, currentProjectTasks, handleSelectSession])
 
   const handleArchiveTask = useCallback(() => {
-    if (activeTask === undefined || activeTask.running || pendingApprovals.length > 0) return
+    if (activeTask === undefined
+      || activeTask.running
+      || pendingApprovals.length > 0
+      || pendingQuestions.length > 0
+      || pendingPlanReviews.length > 0) return
     const nextState = archiveTask(taskArchiveState, activeTask.id)
     saveTaskArchiveState(nextState)
     setTaskArchiveState(nextState)
@@ -827,7 +1142,7 @@ export function App() {
     setActiveTaskId(nextTask?.id)
     closeCommandCenter()
     if (nextTask !== undefined) void restoreTask(nextTask)
-  }, [activeTask, closeCommandCenter, currentProjectTasks, pendingApprovals.length, restoreTask, taskArchiveState])
+  }, [activeTask, closeCommandCenter, currentProjectTasks, pendingApprovals.length, pendingPlanReviews.length, pendingQuestions.length, restoreTask, taskArchiveState])
 
   const handleRestoreArchivedTask = useCallback((task: TaskSession) => {
     const nextState = restoreArchivedTask(taskArchiveState, task.id)
@@ -835,63 +1150,78 @@ export function App() {
     setTaskArchiveState(nextState)
     setArchiveViewOpen(false)
     setCommandCenterOpen(false)
+    updateComposingNewSession(false)
     void restoreTask(task)
-  }, [restoreTask, taskArchiveState])
+  }, [restoreTask, taskArchiveState, updateComposingNewSession])
 
-  const handleNewSession = useCallback(async () => {
-    if (workspacePath.trim() === '') {
+  const handleNewSession = useCallback(() => {
+    const targetPath = workspacePath.trim() || workspaceCatalog.projects[0]?.path || ''
+    if (targetPath === '') {
       openProjectCenter()
       return
     }
-    setBusy(true)
+    taskSelectionRef.current.invalidate()
+    artifactAttemptRef.current += 1
+    if (targetPath !== workspacePath) {
+      setWorkspacePath(targetPath)
+    }
+    updateComposingNewSession(true)
+    setActiveTaskId(undefined)
+    setArtifactBaseline(undefined)
+    setArtifactSnapshot(undefined)
+    setSelectedArtifactChangeId(undefined)
+    setArtifactCommitFlow(undefined)
+    setTaskInput('')
+    setPendingImages([])
+    setError(undefined)
+    restoreManagedFocus('task-input')
+  }, [openProjectCenter, updateComposingNewSession, workspaceCatalog.projects, workspacePath])
+
+  const applyActiveSessionPermission = useCallback(async (nextMode: TaskPermissionMode) => {
+    if (activeTask === undefined || permissionChangeBusy || nextMode === activePermissionMode) return
+    setPermissionChangeBusy(true)
+    setPermissionChangeError(undefined)
     setError(undefined)
     try {
-      const proj = workspaceCatalog.projects.find(p => p.path === workspacePath)
-      const targetPermission: TaskPermissionMode = proj?.permissionMode ?? projectPermissionMode ?? 'standard'
-      if (connection !== 'connected') {
-        await activateWorkspace(workspacePath, targetPermission)
-        return
-      }
-      const task = await adapter.createTask({ workspacePath: workspacePath.trim() })
-      setAllTasks(current => [task, ...current])
-      setActiveTaskId(task.id)
-      const newProj: TaskProjection = {
-        ...createTaskProjection(task.id),
-        permissionMode: targetPermission,
-      }
-      setProjections(current => ({ ...current, [task.id]: newProj }))
-      setArtifactBaseline(undefined)
-      setArtifactSnapshot(undefined)
-      setSelectedArtifactChangeId(undefined)
-      await loadTaskArtifacts(task, true)
-      if (targetPermission === 'full-access') {
-        await adapter.setTaskPermission(task.id, targetPermission)
-      }
-      restoreManagedFocus('task-input')
-    } catch (cause) {
-      setError(errorMessage(cause))
-    } finally {
-      setBusy(false)
-    }
-  }, [activateWorkspace, adapter, connection, loadTaskArtifacts, openProjectCenter, projectPermissionMode, workspaceCatalog.projects, workspacePath])
-
-  const handleToggleActiveSessionPermission = useCallback(async () => {
-    if (activeTask === undefined) return
-    const nextMode: TaskPermissionMode = activePermissionMode === 'full-access' ? 'standard' : 'full-access'
-    setProjections(current => {
-      const existing = current[activeTask.id] ?? createTaskProjection(activeTask.id)
-      return {
-        ...current,
-        [activeTask.id]: { ...existing, permissionMode: nextMode },
-      }
-    })
-    setProjectPermissionMode(nextMode)
-    try {
       await adapter.setTaskPermission(activeTask.id, nextMode)
+      setProjections(current => {
+        const existing = current[activeTask.id] ?? createTaskProjection(activeTask.id)
+        return {
+          ...current,
+          [activeTask.id]: { ...existing, permissionMode: nextMode },
+        }
+      })
+      setPermissionConfirmationOpen(false)
+      setCommandCenterOpen(false)
     } catch (cause) {
-      setError(errorMessage(cause))
+      const message = errorMessage(cause)
+      setPermissionChangeError(message)
+      setError(message)
+    } finally {
+      setPermissionChangeBusy(false)
     }
-  }, [activePermissionMode, activeTask, adapter])
+  }, [activePermissionMode, activeTask, adapter, permissionChangeBusy])
+
+  const handleToggleActiveSessionPermission = useCallback(() => {
+    if (activeTask === undefined || permissionChangeBusy) return
+    if (activePermissionMode === 'full-access') {
+      void applyActiveSessionPermission('standard')
+      return
+    }
+    if (!commandCenterOpen && document.activeElement instanceof HTMLElement) {
+      commandReturnFocusRef.current = document.activeElement.dataset.focusId ?? 'task-permission-toggle'
+    }
+    setPermissionChangeError(undefined)
+    setPermissionConfirmationOpen(true)
+    setCommandCenterOpen(true)
+  }, [activePermissionMode, activeTask, applyActiveSessionPermission, commandCenterOpen, permissionChangeBusy])
+
+  const closePermissionConfirmation = useCallback(() => {
+    if (permissionChangeBusy) return
+    setPermissionConfirmationOpen(false)
+    setPermissionChangeError(undefined)
+    restoreManagedFocus('command-toggle-permission')
+  }, [permissionChangeBusy])
 
   const handleNewProject = useCallback(() => {
     openProjectCenter()
@@ -968,13 +1298,6 @@ export function App() {
     }
   }, [])
 
-  const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    if (event.target.files && event.target.files.length > 0) {
-      handleAddImageFiles(event.target.files)
-      event.target.value = ''
-    }
-  }, [handleAddImageFiles])
-
   const handlePaste = useCallback((event: React.ClipboardEvent | ClipboardEvent) => {
     const items = event.clipboardData?.items
     if (!items) return
@@ -1017,109 +1340,185 @@ export function App() {
     }
   }, [handleAddImageFiles])
 
-  const handleSend = () => void run(async () => {
-    if (activeTask === undefined) throw new Error('请先创建任务会话')
+  const handleTriggerScreenshot = useCallback(async () => {
+    if (screenshotBusy) return
+    setScreenshotBusy(true)
+    setError(undefined)
+    try {
+      const dataUrl = await captureScreenImage()
+      const blob = dataUrlToBlob(dataUrl)
+      const copied = await writeImageToClipboard(blob)
+
+      const now = Date.now()
+      setPendingImages(current => [
+        ...current,
+        {
+          id: `att-screenshot-${now}-${Math.random().toString(36).slice(2, 8)}`,
+          mediaType: 'image/png',
+          data: dataUrl,
+          name: `screenshot-${new Date(now).toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`,
+          size: blob.size,
+        },
+      ])
+      if (!copied) setError('截图已添加，但无法写入系统剪贴板')
+      requestAnimationFrame(() => focusManagedElement('task-input'))
+    } catch (cause) {
+      const cancelled = cause instanceof DOMException
+        && (cause.name === 'NotAllowedError' || cause.name === 'AbortError')
+      if (!cancelled) setError(errorMessage(cause))
+    } finally {
+      setScreenshotBusy(false)
+    }
+  }, [screenshotBusy])
+
+  const handlePasteFromClipboard = useCallback(async () => {
+    const file = await readImageFromClipboard()
+    if (file) {
+      handleAddImageFiles([file])
+    }
+  }, [handleAddImageFiles])
+
+  const handleSend = useCallback(() => {
+    if (sendBusy) return
     const text = taskInput.trim()
     const imagesToSend = [...pendingImages]
     if (text === '' && imagesToSend.length === 0) return
-    const taskId = activeTask.id
-    const now = Date.now()
-    const optimisticMsg: TaskProjectionMessage = {
-      id: `user-input-${now}`,
-      role: 'user',
-      content: text,
-      time: now,
-      isSystemInjection: false,
-      isCommand: text.startsWith('/'),
-      ...(imagesToSend.length > 0
-        ? {
-            images: imagesToSend.map(img => ({
-              id: img.id,
-              dataUrl: img.data.startsWith('data:') ? img.data : `data:${img.mediaType};base64,${img.data}`,
-              mediaType: img.mediaType,
-              name: img.name,
-              bytes: img.size,
-            })),
-          }
-        : {}),
-    }
-    setProjections(current => {
-      const existing = current[taskId] ?? createTaskProjection(taskId)
-      const { failure: _failure, ...clean } = existing
-      return {
-        ...current,
-        [taskId]: {
-          ...clean,
-          status: 'running',
-          output: '',
-          messages: [...clean.messages, optimisticMsg],
-        },
-      }
-    })
-    setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: true } : t))
-    setTaskInput('')
-    setPendingImages([])
-    try {
-      await adapter.sendInput(taskId, text, imagesToSend)
-    } catch (cause) {
-      const message = errorMessage(cause)
-      setTaskInput(current => current === '' ? text : current)
-      setPendingImages(current => current.length === 0 ? imagesToSend : [...imagesToSend, ...current])
-      setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: false } : t))
-      setProjections(current => {
-        const existing = current[taskId]
-        if (existing === undefined) return current
-        return {
-          ...current,
-          [taskId]: {
-            ...existing,
-            status: 'failed',
-            failure: { message },
-            messages: existing.messages.map(candidate => candidate.id === optimisticMsg.id
-              ? { ...candidate, status: 'failed', failure: { message } }
-              : candidate),
-          },
-        }
-      })
-      throw cause
-    }
-  })
 
-  const handleVoiceInputTrigger = useCallback(async (action: 'tap' | 'press' | 'release' = 'tap') => {
+    setSendBusy(true)
+    setError(undefined)
+
+    void (async () => {
+      let currentTask = activeTask
+      const now = Date.now()
+      const optimisticMsg: TaskProjectionMessage = {
+        id: `user-input-${now}`,
+        role: 'user',
+        content: text,
+        time: now,
+        isSystemInjection: false,
+        isCommand: text.startsWith('/'),
+        ...(imagesToSend.length > 0
+          ? {
+              images: imagesToSend.map(img => ({
+                id: img.id,
+                dataUrl: img.data.startsWith('data:') ? img.data : `data:${img.mediaType};base64,${img.data}`,
+                mediaType: img.mediaType,
+                name: img.name,
+                bytes: img.size,
+              })),
+            }
+          : {}),
+      }
+
+      try {
+        if (currentTask === undefined) {
+          const targetPath = workspacePath.trim() || workspaceCatalog.projects[0]?.path || ''
+          if (targetPath === '') {
+            openProjectCenter()
+            throw new Error('请先选择或创建一个项目')
+          }
+          if (targetPath !== workspacePath) {
+            setWorkspacePath(targetPath)
+          }
+          taskSelectionRef.current.invalidate()
+          const proj = workspaceCatalog.projects.find(p => p.path === targetPath)
+          const targetPermission: TaskPermissionMode = proj?.permissionMode ?? projectPermissionMode ?? 'standard'
+          if (connection !== 'connected') {
+            await ensureRuntimeReady(targetPath)
+          }
+          const newTask = await adapter.createTask({ workspacePath: targetPath })
+          await adapter.setTaskPermission(newTask.id, targetPermission)
+          setAllTasks(current => [newTask, ...current.filter(t => t.id !== newTask.id)])
+          setActiveTaskId(newTask.id)
+          updateComposingNewSession(false)
+          const newProj: TaskProjection = {
+            ...createTaskProjection(newTask.id),
+            permissionMode: targetPermission,
+          }
+          setProjections(current => ({ ...current, [newTask.id]: newProj }))
+          setArtifactBaseline(undefined)
+          setArtifactSnapshot(undefined)
+          setSelectedArtifactChangeId(undefined)
+          setArtifactCommitFlow(undefined)
+          void loadTaskArtifacts(newTask, true)
+          currentTask = newTask
+        }
+
+        const taskId = currentTask.id
+        setProjections(current => {
+          const existing = current[taskId] ?? createTaskProjection(taskId)
+          const { failure: _failure, ...clean } = existing
+          return {
+            ...current,
+            [taskId]: {
+              ...clean,
+              status: 'running',
+              output: '',
+              messages: [...clean.messages, optimisticMsg],
+            },
+          }
+        })
+        setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: true } : t))
+        setTaskInput('')
+        setPendingImages([])
+        await adapter.sendInput(taskId, text, imagesToSend)
+      } catch (cause) {
+        const message = errorMessage(cause)
+        setError(message)
+        setTaskInput(current => current === '' ? text : current)
+        setPendingImages(current => current.length === 0 ? imagesToSend : [...imagesToSend, ...current])
+        if (currentTask !== undefined) {
+          const taskId = currentTask.id
+          setAllTasks(current => current.map(t => t.id === taskId ? { ...t, running: false } : t))
+          setProjections(current => {
+            const existing = current[taskId]
+            if (existing === undefined) return current
+            return {
+              ...current,
+              [taskId]: {
+                ...existing,
+                status: 'failed',
+                failure: { message },
+                messages: existing.messages.map(candidate => candidate.id === optimisticMsg.id
+                  ? { ...candidate, status: 'failed', failure: { message } }
+                  : candidate),
+              },
+            }
+          })
+        }
+      } finally {
+        setSendBusy(false)
+      }
+    })()
+  }, [activeTask, adapter, connection, ensureRuntimeReady, loadTaskArtifacts, openProjectCenter, pendingImages, projectPermissionMode, sendBusy, taskInput, updateComposingNewSession, workspaceCatalog.projects, workspacePath])
+
+  const handleVoiceInputTrigger = useCallback((action: 'tap' | 'press' | 'release' = 'tap') => {
     if (!voiceConfig.enabled) return
 
     const active = document.activeElement
-    if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) {
+    if (!isEditableVoiceInputTarget(active)) {
       focusManagedElement('task-input')
     }
 
-    if (voiceConfig.mode === 'toggle') {
-      if (action === 'release') return
-      const nextState = !isVoiceActive
-      setIsVoiceActive(nextState)
-      try {
-        await simulateKeyAction(voiceConfig.targetKey, 'tap', voiceConfig.customKeyCode)
-      } catch (err) {
-        console.error('模拟按键失败', err)
-      }
-    } else {
-      if (action === 'press') {
-        setIsVoiceActive(true)
-        try {
-          await simulateKeyAction(voiceConfig.targetKey, 'press', voiceConfig.customKeyCode)
-        } catch (err) {
-          console.error('模拟按键按下失败', err)
-        }
-      } else if (action === 'release') {
-        setIsVoiceActive(false)
-        try {
-          await simulateKeyAction(voiceConfig.targetKey, 'release', voiceConfig.customKeyCode)
-        } catch (err) {
-          console.error('模拟按键释放失败', err)
-        }
-      }
-    }
-  }, [voiceConfig, isVoiceActive])
+    if (action === 'press') setIsVoicePressed(true)
+    if (action === 'release') setIsVoicePressed(false)
+
+    const target = action === 'release'
+      ? pressedVoiceTargetRef.current ?? voiceConfig
+      : voiceConfig
+    if (action === 'press') pressedVoiceTargetRef.current = target
+    if (action === 'release') pressedVoiceTargetRef.current = null
+
+    voiceActionQueueRef.current = voiceActionQueueRef.current
+      .catch(() => undefined)
+      .then(() => simulateKeyAction(target.targetKey, action, target.customKeyCode))
+      .catch(err => {
+        setIsVoicePressed(false)
+        setError(errorMessage(err))
+        void refreshVoiceCapabilities()
+        console.error(`模拟按键${action === 'press' ? '按下' : action === 'release' ? '释放' : ''}失败`, err)
+      })
+  }, [refreshVoiceCapabilities, voiceConfig])
 
   const handlePauseTask = useCallback(() => void run(async () => {
     if (activeTask === undefined) return
@@ -1182,7 +1581,7 @@ export function App() {
     const change = artifactSnapshot.changes.find(candidate => candidate.changeId === changeId)
     if (change === undefined) return
     commandReturnFocusRef.current = `inspector-file-${changeId}`
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setArtifactMutationError(undefined)
     setArtifactConfirmation({ kind: 'reject-file', changeId, path: change.path, returnTo: 'inspector' })
     setCommandCenterOpen(true)
@@ -1190,7 +1589,7 @@ export function App() {
 
   const requestRollbackTaskArtifacts = useCallback(() => {
     if (!canRollbackArtifacts) return
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setArtifactMutationError(undefined)
     setArtifactConfirmation({ kind: 'rollback-task', returnTo: 'command' })
   }, [canRollbackArtifacts])
@@ -1251,7 +1650,7 @@ export function App() {
     const acceptedCount = acceptedArtifactCount
     const attempt = commitAttemptRef.current + 1
     commitAttemptRef.current = attempt
-    setSelectedApprovalId(undefined)
+    setSelectedApprovalSelection(undefined)
     setArtifactConfirmation(undefined)
     setArtifactMutationError(undefined)
     setArtifactCommitFlow({
@@ -1416,8 +1815,8 @@ export function App() {
     const previous = previousArtifactStatusRef.current
     const current = projection?.status
     previousArtifactStatusRef.current = current
-    const executionStopped = previous === 'running' || previous === 'waiting-approval'
-    const workspaceStable = current !== 'running' && current !== 'waiting-approval'
+    const executionStopped = previous === 'running' || previous === 'waiting-approval' || previous === 'waiting-response'
+    const workspaceStable = current !== 'running' && current !== 'waiting-approval' && current !== 'waiting-response'
     if (!executionStopped || !workspaceStable || activeTask === undefined || artifactBaseline === undefined) return
     void loadTaskArtifacts(activeTask, false)
   }, [activeTask, artifactBaseline, loadTaskArtifacts, projection?.status])
@@ -1490,37 +1889,51 @@ export function App() {
   const connected = connection === 'connected'
   const events = projection?.events ?? []
   const activityItems = useMemo(() => aggregateActivityItems(events), [events])
-  const canPauseTask = (projection?.status === 'running' || projection?.status === 'waiting-approval') && !busy
+  const canPauseTask = (projection?.status === 'running'
+    || projection?.status === 'waiting-approval'
+    || projection?.status === 'waiting-response') && !busy
   const focusGraph = useMemo(() => createAppFocusGraph({
     connected,
-    hasActiveTask: activeTask !== undefined,
+    hasActiveTask: activeTask !== undefined || composingNewSession,
     hasFailureAction: projection?.failure?.code === 'MISSING_CREDENTIAL',
     busy,
     canPauseTask,
-    canSend: (taskInput.trim() !== '' || pendingImages.length > 0) && !busy,
+    canSend: (taskInput.trim() !== '' || pendingImages.length > 0) && !sendBusy,
     settingsOpen,
     commandCenterOpen,
     approvalDetailOpen: selectedApproval !== undefined,
     archiveViewOpen,
     archivedTaskCount: archivedTaskList.length,
     canArchiveTask: activeTask !== undefined && !activeTask.running && !canPauseTask,
+    permissionConfirmationOpen,
     artifactConfirmationOpen: artifactConfirmation !== undefined,
     ...(artifactCommitFlow === undefined ? {} : { commitPhase: artifactCommitFlow.phase }),
     approvalResponding: approvalRespondingId !== undefined,
-    pendingApprovalCount: pendingApprovals.length,
+    pendingApprovalCount: allPendingApprovals.length,
+    pendingQuestionCount: allPendingQuestions.length,
+    pendingPlanReviewCount: allPendingPlanReviews.length,
+    ...(selectedPendingResponse === undefined ? {} : { pendingResponseKind: selectedPendingResponse.kind }),
+    questionOptionCount: selectedQuestion?.options?.length ?? 0,
+    questionAnswered: selectedQuestionAnswered,
+    questionHasPrevious: questionIndex > 0,
+    questionHasNext: selectedQuestionRequest !== undefined && questionIndex < selectedQuestionRequest.questions.length - 1,
+    planReviewHasDecline: selectedPlanReview?.decline !== undefined,
     projectCenterOpen,
     projectPermissionMode,
     projectCount: workspaceCatalog.projects.length,
     activeProjectIndex: activeProjectIndex >= 0 ? activeProjectIndex : 0,
     sessionCount: currentProjectTasks.length,
     activeSessionIndex: activeSessionIndex >= 0 ? activeSessionIndex : 0,
+    draftSession: composingNewSession,
     hasWorkspaceBase: workspaceCatalog.baseDirectory !== undefined,
     canCreateProject: projectName.trim() !== '' && !projectBusy,
     selectedProvider,
     settingsReady: credentialStatus !== undefined,
     credentialWritable: credentialStatus?.writable === true,
     canSaveSettings: canApplyModel && !settingsBusy,
+    voicePermissionActionAvailable: voiceCapabilities?.permissionRequired === true && voiceCapabilities.permissionGranted !== true,
     inspectorPage,
+    inspectorOpen,
     artifactChangeIds: artifactSnapshot?.changes.map(change => change.changeId) ?? [],
     ...(selectedArtifactChangeId === undefined ? {} : { selectedArtifactChangeId }),
     selectedArtifactAccepted: selectedArtifactChange?.review === 'accepted',
@@ -1530,41 +1943,54 @@ export function App() {
     canContinueCommit: artifactCommitFlow?.phase === 'editing' && artifactCommitFlow.message.trim() !== '',
     lightboxOpen: lightboxImage !== null,
     pendingAttachmentIds: pendingImages.map(img => img.id),
-  }), [activeProjectIndex, activeSessionIndex, activeTask, approvalRespondingId, archiveViewOpen, archivedTaskList.length, artifactCommitFlow, artifactConfirmation, artifactSnapshot?.changes, busy, canApplyModel, canCommitArtifacts, canPauseTask, canReviewArtifacts, canRollbackArtifacts, commandCenterOpen, connected, credentialStatus, currentProjectTasks.length, inspectorPage, lightboxImage, pendingApprovals.length, pendingImages, projectBusy, projectCenterOpen, projectName, projectPermissionMode, projection?.failure?.code, selectedApproval, selectedArtifactChange?.review, selectedArtifactChangeId, selectedProvider, settingsBusy, settingsOpen, taskInput, workspaceCatalog])
+    ...(gamepadSelect === null ? {} : {
+      gamepadSelectOptionIds: gamepadSelect.choices.map(choice => `gamepad-select-option-${choice.optionIndex}`),
+      gamepadSelectSelectedId: `gamepad-select-option-${gamepadSelect.choices.find(choice => choice.selected)?.optionIndex ?? gamepadSelect.choices[0]?.optionIndex ?? 0}`,
+    }),
+  }), [activeProjectIndex, activeSessionIndex, activeTask, allPendingApprovals.length, allPendingPlanReviews.length, allPendingQuestions.length, approvalRespondingId, archiveViewOpen, archivedTaskList.length, artifactCommitFlow, artifactConfirmation, artifactSnapshot?.changes, busy, canApplyModel, canCommitArtifacts, canPauseTask, canReviewArtifacts, canRollbackArtifacts, commandCenterOpen, composingNewSession, connected, credentialStatus, currentProjectTasks.length, gamepadSelect, inspectorOpen, inspectorPage, lightboxImage, pendingImages, permissionConfirmationOpen, projectBusy, projectCenterOpen, projectName, projectPermissionMode, projection?.failure?.code, questionIndex, selectedApproval, selectedArtifactChange?.review, selectedArtifactChangeId, selectedPendingResponse, selectedPlanReview?.decline, selectedProvider, selectedQuestion?.options?.length, selectedQuestionAnswered, selectedQuestionRequest, sendBusy, settingsBusy, settingsOpen, taskInput, voiceCapabilities, workspaceCatalog])
 
   useSemanticNavigation({
     graph: focusGraph,
-    onCommandCenter: toggleCommandCenter,
+    enabled: true,
+    ...(lightboxImage === null && gamepadSelect === null ? { onCommandCenter: toggleCommandCenter } : {}),
+    onOpenSelect: openGamepadSelect,
     onPauseTask: handlePauseTask,
-    onVoiceInput: handleVoiceInputTrigger,
+    ...(lightboxImage === null ? { onVoiceInput: handleVoiceInputTrigger } : {}),
     voiceInputGamepadButton: voiceConfig.gamepadButton,
-    onPreviousProject: handlePreviousProject,
-    onNextProject: handleNextProject,
-    onPreviousSession: handlePreviousSession,
-    onNextSession: handleNextSession,
-    onNewSession: handleNewSession,
-    onNewProject: handleNewProject,
-    ...(!settingsOpen && !projectCenterOpen && !commandCenterOpen && inspectorPage === 'changes' && selectedArtifactChangeId !== undefined
+    ...(lightboxImage === null && gamepadSelect === null ? {
+      onPreviousProject: handlePreviousProject,
+      onNextProject: handleNextProject,
+      onPreviousSession: handlePreviousSession,
+      onNextSession: handleNextSession,
+      onNewSession: handleNewSession,
+      onNewProject: handleNewProject,
+      onScreenshot: () => void handleTriggerScreenshot(),
+    } : {}),
+    ...(!settingsOpen && !projectCenterOpen && !commandCenterOpen && lightboxImage === null && gamepadSelect === null && inspectorPage === 'changes' && selectedArtifactChangeId !== undefined
       ? {
           onPrimaryAction: () => handleAcceptArtifactChange(selectedArtifactChangeId),
           onMoreActions: () => requestRejectArtifactChange(selectedArtifactChangeId),
         }
-      : !settingsOpen && !projectCenterOpen && !commandCenterOpen
+      : !settingsOpen && !projectCenterOpen && !commandCenterOpen && lightboxImage === null && gamepadSelect === null
         ? {
             onPrimaryAction: handleNewProject,
             onMoreActions: () => void handleNewSession(),
           }
         : {}),
-    ...(!settingsOpen && !projectCenterOpen && !commandCenterOpen && activeTask !== undefined
+    ...(!settingsOpen && !projectCenterOpen && !commandCenterOpen && lightboxImage === null && gamepadSelect === null && activeTask !== undefined && inspectorOpen
       ? {
           onPreviousPage: () => moveInspectorPage(-1),
           onNextPage: () => moveInspectorPage(1),
         }
       : {}),
-    ...(lightboxImage !== null
+    ...(gamepadSelect !== null
+      ? { onBack: closeGamepadSelect }
+      : lightboxImage !== null
       ? { onBack: closeImageLightbox }
       : projectCenterOpen
       ? { onBack: closeProjectCenter }
+      : commandCenterOpen && permissionConfirmationOpen
+        ? { onBack: closePermissionConfirmation }
       : commandCenterOpen && artifactConfirmation !== undefined
         ? { onBack: closeArtifactConfirmation }
       : commandCenterOpen && artifactCommitFlow !== undefined
@@ -1573,12 +1999,103 @@ export function App() {
           : artifactCommitFlow.phase === 'committing'
             ? {}
             : { onBack: closeArtifactCommitFlow }
+      : commandCenterOpen && selectedPendingResponse !== undefined
+        ? { onBack: closePendingResponseDetail }
       : commandCenterOpen && selectedApproval !== undefined
         ? { onBack: closeApprovalDetail }
         : commandCenterOpen
           ? { onBack: closeCommandCenter }
         : settingsOpen ? { onBack: closeSettings } : {}),
   })
+
+  const voiceGamepadConflict = gamepadButtonConflict(voiceConfig.gamepadButton)
+  const composerForm = (
+    <>
+      <form
+        className={`composer ${isDraggingOver ? 'composer--dragover' : ''}`}
+        onSubmit={(event) => { event.preventDefault(); handleSend() }}
+      >
+        <label htmlFor="task-input">{composingNewSession ? '这条消息会开启新会话' : '告诉 JoyDSH 要完成什么'}</label>
+        <AttachmentRail
+          images={pendingImages}
+          onRemove={handleRemoveImage}
+          onPreview={handlePreviewPendingImage}
+        />
+        <div className="composer-input-wrap">
+          <textarea
+            data-focus-id="task-input"
+            id="task-input"
+            value={taskInput}
+            onChange={event => setTaskInput(event.target.value)}
+            onKeyDown={event => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                event.preventDefault()
+                if ((taskInput.trim() !== '' || pendingImages.length > 0) && !sendBusy) handleSend()
+              }
+            }}
+            placeholder={composingNewSession
+              ? (pendingImages.length > 0 ? '附加说明（可选），发送后开启新会话' : '描述新任务，发送后会开启独立会话')
+              : (pendingImages.length > 0 ? '附加说明（可选）或按 Cmd+Enter 发送' : '输入任务目标，或粘贴 / 拖入图片')}
+            rows={5}
+          />
+        </div>
+        <div className="composer-actions">
+          <div className="composer-actions__left">
+            {canPauseTask ? (
+              <button data-focus-id="pause-task" className="icon-button icon-button--danger" type="button" onClick={handlePauseTask} title="立即暂停" aria-label="立即暂停当前执行">
+                <CirclePause aria-hidden="true" />
+              </button>
+            ) : null}
+            <button
+              data-focus-id="voice-input"
+              className={`button button--voice ${isVoicePressed ? 'button--voice-pressed' : ''}`}
+              type="button"
+              onClick={() => void handleVoiceInputTrigger('tap')}
+              title={`语音输入 (手柄 ${GAMEPAD_BUTTON_OPTIONS.find(option => option.index === voiceConfig.gamepadButton)?.label ?? voiceConfig.gamepadButton} / 快捷键 Cmd+Shift+V)\n模拟按键: ${voiceConfig.targetKey}`}
+              aria-label="触发语音输入模拟按键"
+              aria-pressed={isVoicePressed}
+            >
+              <Mic className={`voice-icon ${isVoicePressed ? 'voice-icon--pressed' : ''}`} aria-hidden="true" />
+              <span>{isVoicePressed ? '按键已按下' : '语音输入'}</span>
+            </button>
+            <button
+              data-focus-id="screenshot-button"
+              className={`button button--secondary ${screenshotBusy ? 'is-loading' : ''}`}
+              type="button"
+              onClick={() => void handleTriggerScreenshot()}
+              disabled={screenshotBusy}
+              title="截取当前 JoyDSH 页面 (快捷键 F7 / PrintScreen / Cmd+Shift+S)"
+              aria-label="截取当前 JoyDSH 页面"
+            >
+              <Camera aria-hidden="true" />
+              <span>{screenshotBusy ? '截图中...' : '截图'}</span>
+            </button>
+            <button
+              data-focus-id="paste-image"
+              className="button button--secondary"
+              type="button"
+              onClick={() => void handlePasteFromClipboard()}
+              title="从系统剪贴板粘贴图片 (Cmd+V)"
+              aria-label="从剪贴板粘贴图片"
+            >
+              <ClipboardPaste aria-hidden="true" />
+              <span>粘贴</span>
+            </button>
+          </div>
+          <button
+            data-focus-id="send-task"
+            className="button button--primary button--tv"
+            type="submit"
+            disabled={(taskInput.trim() === '' && pendingImages.length === 0) || sendBusy}
+          >
+            <Send aria-hidden="true" />
+            {composingNewSession ? '开启会话' : '发送'}
+          </button>
+        </div>
+      </form>
+      {error === undefined ? null : <div className="inline-error" role="alert">{error}</div>}
+    </>
+  )
 
   return (
     <main
@@ -1613,7 +2130,13 @@ export function App() {
                 const isActive = project.path === workspacePath
                 const projectTasks = allTasks.filter(task => task.workspacePath === project.path)
                 const projectRunning = projectTasks.some(task => task.running || projections[task.id]?.status === 'running')
-                const projectApprovals = projectTasks.reduce((count, task) => count + (projections[task.id]?.pendingApprovals.length ?? 0), 0)
+                const projectResponses = projectTasks.reduce((count, task) => {
+                  const taskProjection = projections[task.id]
+                  return count
+                    + (taskProjection?.pendingApprovals.length ?? 0)
+                    + (taskProjection?.pendingQuestions.length ?? 0)
+                    + (taskProjection?.pendingPlanReviews.length ?? 0)
+                }, 0)
                 return (
                   <button
                     key={project.path}
@@ -1631,10 +2154,10 @@ export function App() {
                       <strong>{project.name}</strong>
                     </div>
                     <div className="ps5-project-tab__badge">
-                      {projectApprovals > 0 ? (
+                      {projectResponses > 0 ? (
                         <span className="ps5-pill ps5-pill--warning">
                           <ShieldAlert aria-hidden="true" />
-                          {projectApprovals}
+                          {projectResponses}
                         </span>
                       ) : projectRunning ? (
                         <span className="ps5-pill ps5-pill--running">
@@ -1685,7 +2208,7 @@ export function App() {
         </div>
       </header>
 
-      <div className={`workspace-grid${workspacePath ? ' workspace-grid--with-sidebar' : ''}`}>
+      <div className={`workspace-grid${workspacePath ? ' workspace-grid--with-sidebar' : ''}${inspectorOpen ? '' : ' workspace-grid--inspector-hidden'}`}>
         {workspacePath ? (
           <aside className="sessions-sidebar" aria-label="会话列表">
             <div className="sessions-sidebar__header">
@@ -1696,12 +2219,13 @@ export function App() {
               </div>
               <button
                 data-focus-id="session-card-new"
-                className="icon-button icon-button--quiet sessions-sidebar__add"
+                className={`icon-button icon-button--quiet sessions-sidebar__add${composingNewSession ? ' sessions-sidebar__add--active' : ''}`}
                 type="button"
-                onClick={() => void handleNewSession()}
+                onClick={() => handleNewSession()}
                 disabled={busy}
                 title="新建任务会话 (快捷键 △)"
                 aria-label="新建任务会话"
+                aria-pressed={composingNewSession}
               >
                 <Plus aria-hidden="true" />
               </button>
@@ -1709,9 +2233,12 @@ export function App() {
 
             <div className="sessions-sidebar__list" role="tablist" aria-label="任务会话" data-scroll-region="sessions-sidebar">
               {currentProjectTasks.map((task, index) => {
-                const isSessionActive = activeTask?.id === task.id
+                const isSessionActive = !composingNewSession && activeTask?.id === task.id
                 const taskProj = projections[task.id]
                 const taskStatus = taskProj?.status ?? (task.running ? 'running' : 'idle')
+                const taskPendingCount = (taskProj?.pendingApprovals.length ?? 0)
+                  + (taskProj?.pendingQuestions.length ?? 0)
+                  + (taskProj?.pendingPlanReviews.length ?? 0)
                 return (
                   <button
                     key={task.id}
@@ -1728,8 +2255,8 @@ export function App() {
                     <div className="session-card-item__content">
                       <span className="session-card-item__title">{task.title ?? shortId(task.id)}</span>
                     </div>
-                    {taskProj && taskProj.pendingApprovals.length > 0 ? (
-                      <em className="ps5-chip-badge">{taskProj.pendingApprovals.length}</em>
+                    {taskPendingCount > 0 ? (
+                      <em className="ps5-chip-badge">{taskPendingCount}</em>
                     ) : null}
                   </button>
                 )
@@ -1747,13 +2274,27 @@ export function App() {
         <section className="task-panel" aria-labelledby="task-heading">
           <div className="panel-heading">
             <div className="panel-heading__title">
-              <h1 id="task-heading">{activeProject?.name ?? (activeTask === undefined ? '项目' : '当前任务')}</h1>
-              {activeTask === undefined ? null : <span className="session-id">{activeTask.title ?? shortId(activeTask.id)}</span>}
+              <h1 id="task-heading">{activeProject?.name ?? (activeTask === undefined && !composingNewSession ? '项目' : composingNewSession ? '新会话' : '当前任务')}</h1>
+              {composingNewSession
+                ? <span className="session-id">尚未发送</span>
+                : activeTask === undefined ? null : <span className="session-id">{activeTask.title ?? shortId(activeTask.id)}</span>}
             </div>
+            <button
+              data-focus-id="inspector-toggle"
+              className="icon-button icon-button--quiet inspector-toggle"
+              type="button"
+              onClick={() => setInspectorOpen(open => !open)}
+              title={inspectorOpen ? '隐藏任务检查器' : '显示任务检查器'}
+              aria-label={inspectorOpen ? '隐藏任务检查器' : '显示任务检查器'}
+              aria-pressed={inspectorOpen}
+              aria-controls="task-inspector"
+            >
+              {inspectorOpen ? <PanelRightClose aria-hidden="true" /> : <PanelRightOpen aria-hidden="true" />}
+            </button>
           </div>
 
           <div className="task-surface">
-            {activeTask === undefined ? (
+            {activeTask === undefined && !composingNewSession ? (
               <div className="empty-state empty-state--action">
                 <span className="step-label">{activeProject ? '项目工作区' : '工作空间'}</span>
                 <h2>{activeProject ? `${activeProject.name} · 暂无活跃会话` : '选择一个项目'}</h2>
@@ -1789,6 +2330,15 @@ export function App() {
                 )}
                 {error === undefined ? null : <div className="inline-error" role="alert">{error}</div>}
               </div>
+            ) : composingNewSession ? (
+              <div className="new-session-canvas">
+                <div className="new-session-canvas__intro">
+                  <span className="step-label">新会话</span>
+                  <h2>开始一项新任务</h2>
+                  <p>{activeProject ? `${activeProject.name} · 这条消息会开启独立会话，不会发到现有历史里。` : '这条消息会开启独立会话，不会发到现有历史里。'}</p>
+                </div>
+                {composerForm}
+              </div>
             ) : (
               <div className={`active-task${projection !== undefined && projection.plan.length > 0 ? ' active-task--with-plan' : ''}`}>
                 <div className="task-status">
@@ -1802,14 +2352,37 @@ export function App() {
                     className={`permission-badge permission-badge--${activePermissionMode} permission-badge--interactive`}
                     type="button"
                     onClick={() => void handleToggleActiveSessionPermission()}
+                    disabled={permissionChangeBusy}
                     title={`当前为${permissionLabel(activePermissionMode)}，点击切换为${activePermissionMode === 'full-access' ? '标准权限（敏感操作需要审批）' : '完全访问（免审批自动执行）'}`}
                   >
                     <ShieldCheck aria-hidden="true" />
                     <span>{permissionLabel(activePermissionMode)}</span>
-                    <small className="permission-badge__hint">点击切换</small>
+                    <small className="permission-badge__hint">{permissionChangeBusy ? '切换中' : '点击切换'}</small>
                   </button>
                   <span className="event-count">{activityItems.length} 条动态</span>
                 </div>
+                {pendingQuestions.length > 0 || pendingPlanReviews.length > 0 ? (
+                  <section className="task-approval-alert task-response-alert" aria-labelledby="task-response-title" role="status">
+                    {pendingPlanReviews.length > 0 ? <FileCheck2 aria-hidden="true" /> : <CircleHelp aria-hidden="true" />}
+                    <div>
+                      <span>需要你的回应</span>
+                      <strong id="task-response-title">
+                        {pendingPlanReviews.length > 0
+                          ? pendingPlanReviews[0]?.question ?? '审阅实施方案'
+                          : pendingQuestions[0]?.questions[0]?.question ?? '补充任务信息'}
+                      </strong>
+                      <p>{pendingPlanReviews.length} 项方案审阅 · {pendingQuestions.length} 组问题</p>
+                    </div>
+                    <button
+                      data-focus-id="task-response-open"
+                      className="button button--primary"
+                      type="button"
+                      onClick={pendingPlanReviews.length > 0 ? openPlanReviewDetail : openQuestionDetail}
+                    >
+                      查看并回应
+                    </button>
+                  </section>
+                ) : null}
                 {pendingApprovals.length > 0 ? (
                   <section className="task-approval-alert" aria-labelledby="task-approval-title" role="status">
                     <ShieldAlert aria-hidden="true" />
@@ -1882,9 +2455,9 @@ export function App() {
 
                         if (msg.role === 'assistant') {
                           const isLatest = index === conversationMessages.length - 1
-                          const isStreaming = msg.status === 'streaming' || (isLatest && projection?.status === 'running')
-                          const isFailed = msg.status === 'failed' || (isLatest && projection?.status === 'failed')
-                          const failure = msg.failure ?? (isLatest ? projection?.failure : undefined)
+                          const isStreaming = isLatest && (msg.status === 'streaming' || projection?.status === 'running')
+                          const isFailed = isLatest ? (msg.status === 'failed' || projection?.status === 'failed') : msg.status === 'failed'
+                          const failure = isLatest ? (msg.failure ?? projection?.failure) : msg.failure
 
                           return (
                             <div key={msg.id || index} className={`chat-message chat-message--assistant${isFailed ? ' chat-message--error' : ''}`}>
@@ -1991,106 +2564,35 @@ export function App() {
                         ? '正在生成回复...'
                         : projection?.status === 'waiting-approval'
                           ? '正在等待你处理审批'
+                          : projection?.status === 'waiting-response'
+                            ? '正在等待你回应问题或审阅方案'
                           : '发送任务后，回复会显示在这里'}
                     </div>
                   )}
                 </div>
-                <form
-                  className={`composer ${isDraggingOver ? 'composer--dragover' : ''}`}
-                  onSubmit={(event) => { event.preventDefault(); handleSend() }}
-                >
-                  <label htmlFor="task-input">告诉 JoyDSH 要完成什么</label>
-                  <AttachmentRail
-                    images={pendingImages}
-                    onRemove={handleRemoveImage}
-                    onPreview={handlePreviewPendingImage}
-                  />
-                  <div className="composer-input-wrap">
-                    <textarea
-                      data-focus-id="task-input"
-                      id="task-input"
-                      value={taskInput}
-                      onChange={event => setTaskInput(event.target.value)}
-                      onKeyDown={event => {
-                        if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                          event.preventDefault()
-                          if ((taskInput.trim() !== '' || pendingImages.length > 0) && !busy) handleSend()
-                        }
-                      }}
-                      placeholder={pendingImages.length > 0 ? "附加说明（可选）或按 Cmd+Enter 发送" : "输入任务目标，或粘贴 / 拖入图片"}
-                      rows={5}
-                    />
-                  </div>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/png,image/jpeg,image/webp,image/gif"
-                    multiple
-                    style={{ display: 'none' }}
-                    onChange={handleFileInputChange}
-                  />
-                  <div className="composer-actions">
-                    <div className="composer-actions__left">
-                      {canPauseTask ? (
-                        <button data-focus-id="pause-task" className="icon-button icon-button--danger" type="button" onClick={handlePauseTask} title="立即暂停" aria-label="立即暂停当前执行">
-                          <CirclePause aria-hidden="true" />
-                        </button>
-                      ) : null}
-                      <button
-                        data-focus-id="voice-input"
-                        className={`button button--voice ${isVoiceActive ? 'button--voice-active' : ''}`}
-                        type="button"
-                        onClick={() => void handleVoiceInputTrigger('tap')}
-                        title={`语音输入 (手柄 ${GAMEPAD_BUTTON_OPTIONS.find(option => option.index === voiceConfig.gamepadButton)?.label ?? voiceConfig.gamepadButton} / 快捷键 Cmd+Shift+V)\n模拟按键: ${voiceConfig.targetKey}`}
-                        aria-label="触发语音输入模拟按键"
-                      >
-                        <Mic className={`voice-icon ${isVoiceActive ? 'voice-icon--active' : ''}`} aria-hidden="true" />
-                        <span>{isVoiceActive ? '正在听写...' : '语音输入'}</span>
-                      </button>
-                      <button
-                        data-focus-id="attach-image"
-                        className="button button--secondary button--image"
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        title="添加图片 (支持 PNG, JPEG, WebP, GIF)"
-                        aria-label="添加图片附件"
-                      >
-                        <ImageIcon aria-hidden="true" />
-                        <span>图片</span>
-                      </button>
-                    </div>
-                    <button
-                      data-focus-id="send-task"
-                      className="button button--primary button--tv"
-                      type="submit"
-                      disabled={(taskInput.trim() === '' && pendingImages.length === 0) || busy}
-                    >
-                      <Send aria-hidden="true" />
-                      发送
-                    </button>
-                  </div>
-                </form>
-                {error === undefined ? null : <div className="inline-error" role="alert">{error}</div>}
+                {composerForm}
               </div>
             )}
           </div>
         </section>
 
-        <TaskInspector
-          page={inspectorPage}
-          onPageChange={handleInspectorPageChange}
-          events={events}
-          snapshot={artifactSnapshot}
-          loading={artifactsLoading}
-          selectedChangeId={selectedArtifactChangeId}
-          mutationBusy={artifactMutationBusy}
-          {...(artifactMutationError === undefined ? {} : { mutationError: artifactMutationError })}
-          canReview={canReviewArtifacts}
-          onSelectChange={handleSelectArtifactChange}
-          onAcceptChange={handleAcceptArtifactChange}
-          onRequestRejectChange={requestRejectArtifactChange}
-          onEstablishBaseline={handleEstablishBaseline}
-        />
+        {inspectorOpen ? (
+          <TaskInspector
+            page={inspectorPage}
+            onPageChange={handleInspectorPageChange}
+            events={events}
+            snapshot={artifactSnapshot}
+            loading={artifactsLoading}
+            selectedChangeId={selectedArtifactChangeId}
+            mutationBusy={artifactMutationBusy}
+            {...(artifactMutationError === undefined ? {} : { mutationError: artifactMutationError })}
+            canReview={canReviewArtifacts}
+            onSelectChange={handleSelectArtifactChange}
+            onAcceptChange={handleAcceptArtifactChange}
+            onRequestRejectChange={requestRejectArtifactChange}
+            onEstablishBaseline={handleEstablishBaseline}
+          />
+        ) : null}
       </div>
 
       <footer className="ps5-footer-hud">
@@ -2119,7 +2621,7 @@ export function App() {
             closeCommandCenter()
           }
         }}>
-          <section className={selectedApproval === undefined && artifactConfirmation === undefined && artifactCommitFlow === undefined && !archiveViewOpen ? 'command-sheet' : 'command-sheet command-sheet--approval'} role="dialog" aria-modal="true" aria-labelledby="command-title">
+          <section className={selectedApproval === undefined && selectedPendingResponse === undefined && !permissionConfirmationOpen && artifactConfirmation === undefined && artifactCommitFlow === undefined && !archiveViewOpen ? 'command-sheet' : 'command-sheet command-sheet--approval'} role="dialog" aria-modal="true" aria-labelledby="command-title">
             {archiveViewOpen ? (
               <>
                 <header className="command-header approval-header">
@@ -2141,6 +2643,30 @@ export function App() {
                       <span><strong>{task.title ?? shortId(task.id)}</strong><small>{task.workspacePath ?? task.id}</small></span>
                     </button>
                   ))}
+                </div>
+              </>
+            ) : permissionConfirmationOpen ? (
+              <>
+                <header className="command-header permission-confirmation__header">
+                  <ShieldAlert aria-hidden="true" />
+                  <div>
+                    <span className="step-label">会话权限</span>
+                    <h2 id="command-title">启用完全访问</h2>
+                  </div>
+                </header>
+                <div className="permission-confirmation__body">
+                  <strong>当前任务将不再逐项请求审批</strong>
+                  <p>智能体会继承当前系统用户的文件、网络和命令执行权限，也不会额外拦截破坏性操作。仅在你信任当前任务时启用。</p>
+                  {permissionChangeError === undefined ? null : <div className="inline-error" role="alert">{permissionChangeError}</div>}
+                </div>
+                <div className="approval-actions">
+                  <button data-focus-id="permission-cancel" className="button button--tv" type="button" disabled={permissionChangeBusy} onClick={closePermissionConfirmation}>
+                    取消
+                  </button>
+                  <button data-focus-id="permission-confirm" className="button button--warning button--tv" type="button" disabled={permissionChangeBusy} onClick={() => void applyActiveSessionPermission('full-access')}>
+                    <ShieldAlert aria-hidden="true" />
+                    {permissionChangeBusy ? '正在切换' : '启用完全访问'}
+                  </button>
                 </div>
               </>
             ) : artifactConfirmation !== undefined ? (
@@ -2190,6 +2716,117 @@ export function App() {
                 onConfirm={confirmArtifactCommit}
                 onDone={closeCommandCenter}
               />
+            ) : selectedQuestionRequest !== undefined && selectedQuestion !== undefined && selectedQuestionDraft !== undefined ? (
+              <>
+                <header className="command-header approval-header response-header">
+                  <button data-focus-id="question-back" className="icon-button icon-button--quiet" type="button" disabled={responseBusy} onClick={closePendingResponseDetail} title="返回命令中心" aria-label="返回命令中心">
+                    <ArrowLeft aria-hidden="true" />
+                  </button>
+                  <div>
+                    <span className="step-label">待回答问题</span>
+                    <h2 id="command-title">{selectedQuestion.header ?? '需要补充信息'}</h2>
+                  </div>
+                  <span className="response-progress">{questionIndex + 1} / {selectedQuestionRequest.questions.length}</span>
+                </header>
+                <div className="question-response-body" data-scroll-region="question-response">
+                  <section className="question-copy" aria-labelledby="question-prompt">
+                    <h3 id="question-prompt">{selectedQuestion.question}</h3>
+                    {selectedQuestion.detail === undefined ? null : <p>{selectedQuestion.detail}</p>}
+                  </section>
+                  {selectedQuestion.options === undefined || selectedQuestion.options.length === 0 ? null : (
+                    <div className="question-options" role={selectedQuestion.multiSelect === true ? 'group' : 'radiogroup'} aria-label="可选回答">
+                      {selectedQuestion.options.map((option, index) => {
+                        const selected = selectedQuestionDraft.selected.includes(option.label)
+                        return (
+                          <button
+                            key={option.label}
+                            data-focus-id={`question-option-${index}`}
+                            className={`question-option${selected ? ' question-option--selected' : ''}`}
+                            type="button"
+                            role={selectedQuestion.multiSelect === true ? 'checkbox' : 'radio'}
+                            aria-checked={selected}
+                            disabled={responseBusy}
+                            onClick={() => updateSelectedQuestionOption(option.label)}
+                          >
+                            <span className="question-option__mark">{selected ? <Check aria-hidden="true" /> : <Circle aria-hidden="true" />}</span>
+                            <span><strong>{option.label}</strong>{option.description === undefined ? null : <small>{option.description}</small>}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                  <label className="question-custom" htmlFor="question-custom">
+                    <span>其他回答</span>
+                    <textarea
+                      data-focus-id="question-custom"
+                      id="question-custom"
+                      rows={3}
+                      value={selectedQuestionDraft.custom}
+                      disabled={responseBusy}
+                      onChange={event => updateSelectedQuestionCustom(event.target.value)}
+                      placeholder="输入补充信息"
+                    />
+                  </label>
+                  {responseError === undefined ? null : <div className="inline-error" role="alert">{responseError}</div>}
+                </div>
+                <div className="response-actions">
+                  <button data-focus-id="question-cancel" className="button button--danger button--tv" type="button" disabled={responseBusy} onClick={cancelPendingResponse}>
+                    <X aria-hidden="true" />
+                    放弃整组问题
+                  </button>
+                  {questionIndex > 0 ? (
+                    <button data-focus-id="question-previous" className="button button--tv" type="button" disabled={responseBusy} onClick={() => setQuestionIndex(current => Math.max(0, current - 1))}>
+                      <ChevronLeft aria-hidden="true" />
+                      上一题
+                    </button>
+                  ) : null}
+                  <button data-focus-id="question-skip" className="button button--tv" type="button" disabled={responseBusy} onClick={() => advanceQuestion(true)}>
+                    跳过
+                  </button>
+                  <button
+                    data-focus-id={questionIndex < selectedQuestionRequest.questions.length - 1 ? 'question-next' : 'question-submit'}
+                    className="button button--primary button--tv"
+                    type="button"
+                    disabled={responseBusy || !selectedQuestionAnswered}
+                    onClick={() => advanceQuestion(false)}
+                  >
+                    {questionIndex < selectedQuestionRequest.questions.length - 1 ? <ChevronRight aria-hidden="true" /> : <Send aria-hidden="true" />}
+                    {responseBusy ? '正在提交' : questionIndex < selectedQuestionRequest.questions.length - 1 ? '下一题' : '提交回答'}
+                  </button>
+                </div>
+              </>
+            ) : selectedPlanReview !== undefined ? (
+              <>
+                <header className="command-header approval-header response-header response-header--plan">
+                  <button data-focus-id="plan-review-back" className="icon-button icon-button--quiet" type="button" disabled={responseBusy} onClick={closePendingResponseDetail} title="返回命令中心" aria-label="返回命令中心">
+                    <ArrowLeft aria-hidden="true" />
+                  </button>
+                  <div>
+                    <span className="step-label">方案审阅</span>
+                    <h2 id="command-title">{selectedPlanReview.question}</h2>
+                  </div>
+                  <FileCheck2 aria-hidden="true" />
+                </header>
+                <div className="plan-review-body" data-scroll-region="plan-review">
+                  <MarkdownContent content={selectedPlanReview.plan} onPreviewImage={openImageLightbox} />
+                  {responseError === undefined ? null : <div className="inline-error" role="alert">{responseError}</div>}
+                </div>
+                <div className="response-actions response-actions--plan">
+                  <button data-focus-id="plan-review-discuss" className="button button--tv" type="button" disabled={responseBusy} onClick={cancelPendingResponse}>
+                    继续讨论
+                  </button>
+                  {selectedPlanReview.decline === undefined ? null : (
+                    <button data-focus-id="plan-review-decline" className="button button--danger button--tv" type="button" disabled={responseBusy} onClick={() => decidePlanReview(selectedPlanReview.decline?.label ?? '')} title={selectedPlanReview.decline.description}>
+                      <X aria-hidden="true" />
+                      {selectedPlanReview.decline.label}
+                    </button>
+                  )}
+                  <button data-focus-id="plan-review-approve" className="button button--primary button--tv" type="button" disabled={responseBusy} onClick={() => decidePlanReview(selectedPlanReview.approve.label)} title={selectedPlanReview.approve.description}>
+                    <Check aria-hidden="true" />
+                    {responseBusy ? '正在提交' : selectedPlanReview.approve.label}
+                  </button>
+                </div>
+              </>
             ) : selectedApproval === undefined ? (
               <>
                 <header className="command-header">
@@ -2210,12 +2847,30 @@ export function App() {
                     <ArrowLeft aria-hidden="true" />
                     <span><strong>返回当前任务</strong><small>{activeTask === undefined ? '返回工作空间' : shortId(activeTask.id)}</small></span>
                   </button>
-                  {pendingApprovals.length > 0 ? (
+                  {allPendingApprovals.length > 0 ? (
                     <button data-focus-id="command-approvals" className="command-item command-item--warning" type="button" onClick={openApprovalDetail}>
                       <ShieldAlert aria-hidden="true" />
                       <span>
-                        <strong>待审批 {pendingApprovals.length} 项</strong>
-                        <small>{approvalSummary(pendingApprovals[0])}</small>
+                        <strong>待审批 {allPendingApprovals.length} 项</strong>
+                        <small>{approvalSummary(allPendingApprovals[0]?.item)}</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  {allPendingQuestions.length > 0 ? (
+                    <button data-focus-id="command-questions" className="command-item command-item--response" type="button" onClick={openQuestionDetail}>
+                      <CircleHelp aria-hidden="true" />
+                      <span>
+                        <strong>待回答问题 {allPendingQuestions.length} 组</strong>
+                        <small>{allPendingQuestions[0]?.item.questions[0]?.question ?? '运行时正在等待补充信息'}</small>
+                      </span>
+                    </button>
+                  ) : null}
+                  {allPendingPlanReviews.length > 0 ? (
+                    <button data-focus-id="command-plan-reviews" className="command-item command-item--review" type="button" onClick={openPlanReviewDetail}>
+                      <FileCheck2 aria-hidden="true" />
+                      <span>
+                        <strong>待审阅方案 {allPendingPlanReviews.length} 项</strong>
+                        <small>{allPendingPlanReviews[0]?.item.question ?? '实施前需要你的决定'}</small>
                       </span>
                     </button>
                   ) : null}
@@ -2228,10 +2883,8 @@ export function App() {
                       data-focus-id="command-toggle-permission"
                       className="command-item"
                       type="button"
-                      onClick={() => {
-                        closeCommandCenter()
-                        void handleToggleActiveSessionPermission()
-                      }}
+                      disabled={permissionChangeBusy}
+                      onClick={handleToggleActiveSessionPermission}
                     >
                       <ShieldCheck aria-hidden="true" />
                       <span>
@@ -2502,6 +3155,46 @@ export function App() {
                   <h3>语音输入与按键映射</h3>
                   <p>指定手柄触发键，并通过底层按键模拟联动 Spokenly、Superwhisper 或系统听写。</p>
                 </div>
+                {voiceCapabilities?.permissionRequired === true ? (
+                  voiceCapabilities.permissionGranted === true ? (
+                    <div className="voice-permission-state voice-permission-state--granted" role="status">
+                      <ShieldCheck aria-hidden="true" />
+                      <span>macOS 辅助功能权限已授权。</span>
+                    </div>
+                  ) : (
+                    <div className="voice-permission-state voice-permission-state--denied" role="alert">
+                      <ShieldAlert aria-hidden="true" />
+                      <div>
+                        <strong>需要辅助功能权限</strong>
+                        <p>请在“系统设置 &gt; 隐私与安全性 &gt; 辅助功能”中允许 JoyDSH，然后返回此窗口。</p>
+                      </div>
+                      <button
+                        data-focus-id="voice-input-permission"
+                        type="button"
+                        className="button button--secondary"
+                        disabled={voicePermissionBusy}
+                        onClick={async () => {
+                          setVoicePermissionBusy(true)
+                          setVoiceTestStatus(undefined)
+                          try {
+                            const capabilities = await requestKeySimulationPermission()
+                            setVoiceCapabilities(capabilities)
+                            setVoiceTestStatus(capabilities.permissionGranted === true
+                              ? '辅助功能权限已授权'
+                              : '请在系统设置中打开 JoyDSH 的辅助功能权限')
+                          } catch (err) {
+                            setVoiceTestStatus(`权限申请失败：${errorMessage(err)}`)
+                          } finally {
+                            setVoicePermissionBusy(false)
+                          }
+                        }}
+                      >
+                        <ShieldCheck aria-hidden="true" />
+                        {voicePermissionBusy ? '等待系统授权…' : '授权辅助功能'}
+                      </button>
+                    </div>
+                  )
+                ) : null}
                 <div className="model-field">
                   <label htmlFor="voice-input-gamepad-button">手柄触发键</label>
                   <select
@@ -2519,6 +3212,11 @@ export function App() {
                       <option key={option.index} value={option.index}>{option.label}</option>
                     ))}
                   </select>
+                  {voiceGamepadConflict === undefined ? null : (
+                    <p className="input-mapping-warning" role="status">
+                      语音输入将替代该键原有的“{voiceGamepadConflict}”动作。
+                    </p>
+                  )}
                 </div>
                 <div className="model-field">
                   <label htmlFor="voice-input-key">听写软件触发键</label>
@@ -2538,32 +3236,16 @@ export function App() {
                     ))}
                   </select>
                 </div>
-                <div className="model-field">
-                  <label htmlFor="voice-input-mode">触发模式 (Trigger Mode)</label>
-                  <select
-                    data-focus-id="voice-input-mode"
-                    id="voice-input-mode"
-                    value={voiceConfig.mode}
-                    onChange={event => {
-                      const next = { ...voiceConfig, mode: event.target.value as VoiceInputMode }
-                      setVoiceConfig(next)
-                      saveVoiceInputConfig(next)
-                      setVoiceTestStatus(undefined)
-                    }}
-                  >
-                    <option value="toggle">单击切换 (Toggle) — 按一下开始，再按一下结束</option>
-                    <option value="push-to-talk">按住说话 (Push-to-Talk) — 按住开始，松开结束</option>
-                  </select>
-                </div>
                 <div className="voice-test-actions">
                   <button
                     data-focus-id="voice-input-test"
                     type="button"
                     className="button button--secondary"
+                    disabled={voiceCapabilities?.permissionRequired === true && voiceCapabilities.permissionGranted !== true}
                     onClick={async () => {
                       try {
                         await simulateKeyAction(voiceConfig.targetKey, 'tap', voiceConfig.customKeyCode)
-                        setVoiceTestStatus(`已成功模拟按键：${voiceConfig.targetKey}`)
+                        setVoiceTestStatus(`已发送模拟按键：${voiceConfig.targetKey}`)
                       } catch (err) {
                         setVoiceTestStatus(`模拟失败：${errorMessage(err)}`)
                       }
@@ -2584,6 +3266,13 @@ export function App() {
           </section>
         </div>
       ) : null}
+      {gamepadSelect === null ? null : (
+        <GamepadSelectOverlay
+          session={gamepadSelect}
+          onChoose={chooseGamepadSelectOption}
+          onClose={closeGamepadSelect}
+        />
+      )}
       <ImageLightbox
         image={lightboxImage}
         onClose={closeImageLightbox}
@@ -2805,6 +3494,7 @@ function connectionLabel(state: RuntimeConnectionState): string {
 function projectionStatusLabel(status?: TaskProjection['status']): string {
   if (status === 'running') return '执行中'
   if (status === 'waiting-approval') return '等待审批'
+  if (status === 'waiting-response') return '等待回应'
   if (status === 'paused') return '已暂停'
   if (status === 'completed') return '已完成'
   if (status === 'cancelled') return '已停止'
@@ -2832,6 +3522,14 @@ export function permissionDescription(mode: TaskPermissionMode): string {
   return mode === 'full-access'
     ? '完全访问，不再逐项审批'
     : '标准权限，本次操作需要审批'
+}
+
+function isEditableVoiceInputTarget(target: Element | null): boolean {
+  if (target instanceof HTMLTextAreaElement) return !target.disabled && !target.readOnly
+  if (target instanceof HTMLInputElement) {
+    return !target.disabled && !target.readOnly && !NON_TEXT_INPUT_TYPES.has(target.type)
+  }
+  return target instanceof HTMLElement && target.isContentEditable
 }
 
 function approvalSummary(approval?: TaskApproval): string {
@@ -2939,6 +3637,15 @@ export function cycleProjectIndex(currentIndex: number, totalCount: number, dire
     return currentIndex <= 0 ? totalCount - 1 : currentIndex - 1
   }
   return currentIndex < 0 || currentIndex >= totalCount - 1 ? 0 : currentIndex + 1
+}
+
+export function resolveDisplayedTask<T extends { id: string }>(
+  tasks: readonly T[],
+  activeTaskId: string | undefined,
+  composingNewSession: boolean,
+): T | undefined {
+  if (composingNewSession) return undefined
+  return tasks.find(task => task.id === activeTaskId) ?? tasks[0]
 }
 
 export function resolveReconnectionTask(

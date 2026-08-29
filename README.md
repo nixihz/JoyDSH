@@ -49,14 +49,17 @@ The runtime binds strictly to `127.0.0.1:43127` and uses an application-dedicate
 - **D-Pad / Left Stick / Arrow Keys**: Navigate the spatial focus graph with repeat-scroll on hold.
 - **`Enter` / Space / South Button (✕ / A)**: Confirm current selection or trigger actions.
 - **`Escape` / East Button (◯ / B)**: Exit text input, dismiss modals, and reliably restore focus.
-- **`Tab` / `Shift+Tab` / Bumpers (L1/R1, LB/RB)**: Cycle between sidebar, main workspace, and inspector focus regions.
+- **Bumpers (L1/R1, LB/RB) / `[` / `]`**: Cycle between projects.
+- **`Tab` / `Shift+Tab`**: Cycle between sidebar, main workspace, and inspector focus regions; gamepads use spatial D-Pad/left-stick navigation.
 - **Triggers (L2/R2, LT/RT)**: Switch between task inspector tabs: [Live Stream], [Changes], [Artifacts].
 - **West Button (▢ / X) / North Button (△ / Y)**: Quick [Accept Changes] or trigger [Reject Confirmation] in the artifact inspector.
 - **`Cmd/Ctrl+K` / Menu Button (Options/Menu)**: Open the global Command Palette for fast project switching, task rollbacks, agent commits, stopping tasks, or model settings.
-- **`Cmd/Ctrl+Shift+V` / `F5` / Select Button (Share/View)**: Automatically focus task input and simulate voice dictation activation (e.g. Spokenly / system dictation, simulating Right Command by default).
-- **Right Stick**: Smoothly scroll streaming execution logs, diff comparisons, and long text views.
+- **`Cmd/Ctrl+Shift+V` / `F5` / R3 (Right Stick Click)**: Bridge voice input to Spokenly or another external dictation tool (simulating Right Command by default). Spokenly's automatic mode supports short-press toggle and hold-to-talk; the gamepad button is configurable.
 
-Direct keyboard and voice input are used for text and code editing. When an input field is focused, arrow keys control text cursors; pressing `Escape` or the East button immediately restores spatial navigation.
+On macOS, grant JoyDSH access under **System Settings > Privacy & Security > Accessibility** before using simulated voice-input shortcuts. JoyDSH checks this permission and exposes an authorization action in Settings.
+- **Right Stick**: Smoothly scroll streaming execution logs and long text vertically, or wide diff and zoomed-image content horizontally.
+
+Direct keyboard and voice input are used for text and code editing. Dictation preserves the current editable field and falls back to the foreground task input when none is focused; transcribed text is never submitted automatically. When an input field is focused, arrow keys control text cursors; pressing `Escape` or the East button immediately restores spatial navigation.
 
 ## Verification
 

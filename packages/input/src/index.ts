@@ -19,10 +19,13 @@ export type SemanticAction =
   | 'new-project'
   | 'scroll-up'
   | 'scroll-down'
+  | 'scroll-left'
+  | 'scroll-right'
   | 'command-center'
   | 'pause-task'
   | 'voice-input'
   | 'voice-input-release'
+  | 'screenshot'
 
 export interface KeyboardInput {
   key: string
@@ -36,6 +39,12 @@ export interface KeyboardInput {
 }
 
 export function mapKeyboardAction(input: KeyboardInput): SemanticAction | undefined {
+  if (input.key === 'PrintScreen' || input.key === 'F7') {
+    return 'screenshot'
+  }
+  if ((input.key.toLowerCase() === 's' || input.key.toLowerCase() === 'x') && (input.metaKey === true || input.ctrlKey === true) && input.shiftKey === true) {
+    return 'screenshot'
+  }
   if (input.key.toLowerCase() === 'k' && (input.metaKey === true || input.ctrlKey === true)) {
     return 'command-center'
   }
@@ -69,6 +78,8 @@ export function mapKeyboardAction(input: KeyboardInput): SemanticAction | undefi
   if (input.key === 'PageUp') return 'previous-page'
   if (input.key === 'PageDown') return 'next-page'
   if (input.key === 'Enter' || input.key === ' ') return 'confirm'
+  if (input.key.toLowerCase() === 'a') return 'primary-action'
+  if (input.key.toLowerCase() === 'r') return 'more-actions'
   return undefined
 }
 
@@ -79,7 +90,7 @@ export interface GamepadSnapshot {
 
 export interface GamepadMapper {
   update(snapshot: GamepadSnapshot, now: number): SemanticAction[]
-  reset(): void
+  reset(): SemanticAction[]
 }
 
 export interface GamepadMapperOptions {
@@ -88,10 +99,12 @@ export interface GamepadMapperOptions {
   repeatIntervalMs?: number
   menuLongPressMs?: number
   voiceInputButtonIndex?: number
+  screenshotButtonIndex?: number
 }
 
 const REPEATABLE_ACTIONS = new Set<SemanticAction>([
-  'move-up', 'move-down', 'move-left', 'move-right', 'scroll-up', 'scroll-down',
+  'move-up', 'move-down', 'move-left', 'move-right',
+  'scroll-up', 'scroll-down', 'scroll-left', 'scroll-right',
 ])
 
 const BUTTON_ACTIONS: ReadonlyArray<readonly [number, SemanticAction]> = [
@@ -114,14 +127,15 @@ export function createGamepadMapper(options: GamepadMapperOptions = {}): Gamepad
   const initialDelay = options.initialRepeatDelayMs ?? 320
   const repeatInterval = options.repeatIntervalMs ?? 120
   const menuLongPressMs = options.menuLongPressMs ?? 700
-  const voiceInputButtonIndex = options.voiceInputButtonIndex ?? 8
+  const voiceInputButtonIndex = options.voiceInputButtonIndex ?? 11
+  const screenshotButtonIndex = options.screenshotButtonIndex
   const held = new Map<SemanticAction, { pressedAt: number, lastEmittedAt: number }>()
   let menuPressedAt: number | undefined
   let menuLongPressEmitted = false
 
   return {
     update(snapshot, now) {
-      const active = activeGamepadActions(snapshot, threshold, voiceInputButtonIndex)
+      const active = activeGamepadActions(snapshot, threshold, voiceInputButtonIndex, screenshotButtonIndex)
       const emitted: SemanticAction[] = []
       const menuPressed = snapshot.buttons[9] === true
 
@@ -165,9 +179,11 @@ export function createGamepadMapper(options: GamepadMapperOptions = {}): Gamepad
       return emitted
     },
     reset() {
+      const emitted: SemanticAction[] = held.has('voice-input') ? ['voice-input-release'] : []
       held.clear()
       menuPressedAt = undefined
       menuLongPressEmitted = false
+      return emitted
     },
   }
 }
@@ -176,15 +192,20 @@ function activeGamepadActions(
   snapshot: GamepadSnapshot,
   threshold: number,
   voiceInputButtonIndex: number,
+  screenshotButtonIndex?: number,
 ): SemanticAction[] {
   const actions: SemanticAction[] = []
   for (const [index, action] of BUTTON_ACTIONS) {
-    if (index === voiceInputButtonIndex) continue
+    if (index === voiceInputButtonIndex || index === screenshotButtonIndex) continue
     if (snapshot.buttons[index] === true && !actions.includes(action)) actions.push(action)
   }
   if (snapshot.buttons[voiceInputButtonIndex] === true) actions.push('voice-input')
+  if (screenshotButtonIndex !== undefined && snapshot.buttons[screenshotButtonIndex] === true) {
+    actions.push('screenshot')
+  }
   const horizontal = snapshot.axes[0] ?? 0
   const vertical = snapshot.axes[1] ?? 0
+  const scrollHorizontal = snapshot.axes[2] ?? 0
   const scrollVertical = snapshot.axes[3] ?? 0
   if (vertical <= -threshold && !actions.includes('move-up')) actions.push('move-up')
   if (vertical >= threshold && !actions.includes('move-down')) actions.push('move-down')
@@ -192,5 +213,7 @@ function activeGamepadActions(
   if (horizontal >= threshold && !actions.includes('move-right')) actions.push('move-right')
   if (scrollVertical <= -threshold) actions.push('scroll-up')
   if (scrollVertical >= threshold) actions.push('scroll-down')
+  if (scrollHorizontal <= -threshold) actions.push('scroll-left')
+  if (scrollHorizontal >= threshold) actions.push('scroll-right')
   return actions
 }

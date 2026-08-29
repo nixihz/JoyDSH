@@ -32,6 +32,7 @@ export const AttachmentRail = memo(function AttachmentRail({
               <button
                 type="button"
                 className="attachment-card__thumb"
+                data-focus-id={`attachment-preview-${img.id}`}
                 onClick={() => onPreview(img)}
                 aria-label={`预览 ${img.name || '图片'}`}
               >

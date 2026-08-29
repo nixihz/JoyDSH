@@ -4,6 +4,7 @@ import { createGamepadMapper, mapKeyboardAction, type SemanticAction } from '@jo
 
 export interface SemanticNavigationOptions {
   graph: FocusGraph
+  enabled?: boolean
   onBack?(): void
   onCommandCenter?(): void
   onPauseTask?(): void
@@ -19,6 +20,20 @@ export interface SemanticNavigationOptions {
   onNewProject?(): void
   onVoiceInput?(action: 'tap' | 'press' | 'release'): void
   voiceInputGamepadButton?: number
+  onScreenshot?(): void
+  screenshotGamepadButton?: number
+  onOpenSelect?(select: HTMLSelectElement): void
+}
+
+type InputSource = 'gamepad' | 'keyboard'
+
+export function mapVoiceInputTrigger(
+  action: SemanticAction,
+  source: InputSource,
+): 'tap' | 'press' | 'release' | undefined {
+  if (action === 'voice-input') return source === 'gamepad' ? 'press' : 'tap'
+  if (action === 'voice-input-release' && source === 'gamepad') return 'release'
+  return undefined
 }
 
 const SCROLL_STEP_PX = 240
@@ -36,9 +51,13 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
   const optionsRef = useRef(options)
   const previousGraphRef = useRef(options.graph)
   const lastNonTextFocusRef = useRef<string | undefined>(undefined)
+  const pointerTargetRef = useRef<Element | null>(null)
+  const isGamepadModeRef = useRef<boolean>(false)
+  const lastPointerPosRef = useRef<{ x: number; y: number }>({ x: -1, y: -1 })
   optionsRef.current = options
 
   useEffect(() => {
+    if (options.enabled === false) return
     const graph = optionsRef.current.graph
     const currentId = managedFocusId(document.activeElement)
     if (currentId !== undefined && graph.nodes.some(node => node.id === currentId)) {
@@ -49,9 +68,25 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
     previousGraphRef.current = graph
     const frame = requestAnimationFrame(() => focusManagedElement(targetId))
     return () => cancelAnimationFrame(frame)
-  }, [options.graph])
+  }, [options.enabled, options.graph])
 
   useEffect(() => {
+    if (options.enabled === false) return
+    const setGamepadMode = (enabled: boolean): void => {
+      if (isGamepadModeRef.current === enabled) return
+      isGamepadModeRef.current = enabled
+      if (typeof document !== 'undefined') {
+        if (enabled) {
+          document.documentElement.classList.add('gamepad-mode')
+          document.body?.classList.add('gamepad-mode')
+          pointerTargetRef.current = null
+        } else {
+          document.documentElement.classList.remove('gamepad-mode')
+          document.body?.classList.remove('gamepad-mode')
+        }
+      }
+    }
+
     const resolveActiveElement = (graph: FocusGraph): HTMLElement | null => {
       let active = document.activeElement
       let id = managedFocusId(active)
@@ -66,7 +101,10 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       return active instanceof HTMLElement ? active : null
     }
 
-    const handleAction = (action: SemanticAction, source: 'gamepad' | 'keyboard' = 'keyboard'): void => {
+    const handleAction = (action: SemanticAction, source: InputSource = 'keyboard'): void => {
+      if (source === 'gamepad') {
+        setGamepadMode(true)
+      }
       const {
         graph,
         onBack,
@@ -81,6 +119,10 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       const textEntry = isTextEntry(active)
       const move = ACTION_MOVES[action]
       if (move !== undefined) {
+        if (source === 'gamepad' && active instanceof HTMLSelectElement && (action === 'move-left' || action === 'move-right')) {
+          adjustSelectValue(active, action === 'move-left' ? -1 : 1)
+          return
+        }
         if (source === 'keyboard' && textEntry) {
           const isRegion = action === 'previous-region' || action === 'next-region'
           const isVertical = action === 'move-up' || action === 'move-down'
@@ -102,17 +144,7 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
         return
       }
       if (action === 'confirm') {
-        if (source === 'gamepad' && textEntry && active instanceof HTMLElement) {
-          const form = (active as HTMLInputElement | HTMLTextAreaElement).form
-          if (form) {
-            const submitBtn = form.querySelector<HTMLElement>('button[type="submit"], input[type="submit"]')
-            if (submitBtn && !submitBtn.hasAttribute('disabled')) {
-              submitBtn.click()
-              return
-            }
-          }
-        }
-        if (!textEntry && active instanceof HTMLElement) active.click()
+        activateFocusedElement(active, source, optionsRef.current.onOpenSelect)
         return
       }
       if (action === 'back') {
@@ -140,11 +172,25 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
         return
       }
       if (action === 'scroll-up' || action === 'scroll-down') {
-        scrollVisibleRegion(active, action === 'scroll-up' ? -SCROLL_STEP_PX : SCROLL_STEP_PX)
+        const pointerTarget = isGamepadModeRef.current ? null : pointerTargetRef.current
+        scrollVisibleRegion(active, action === 'scroll-up' ? -SCROLL_STEP_PX : SCROLL_STEP_PX, pointerTarget)
+        return
+      }
+      if (action === 'scroll-left' || action === 'scroll-right') {
+        const pointerTarget = isGamepadModeRef.current ? null : pointerTargetRef.current
+        scrollVisibleRegion(active, 0, pointerTarget, action === 'scroll-left' ? -SCROLL_STEP_PX : SCROLL_STEP_PX)
         return
       }
       if (action === 'command-center') onCommandCenter?.()
       if (action === 'pause-task') onPauseTask?.()
+      if (action === 'screenshot') {
+        optionsRef.current.onScreenshot?.()
+        return
+      }
+      if (action === 'primary-action' && source === 'gamepad' && isEditableTextEntry(active)) {
+        deleteBackwardFromTextEntry(active)
+        return
+      }
       if (action === 'primary-action' && (!textEntry || source === 'gamepad')) onPrimaryAction?.()
       if (action === 'more-actions' && (!textEntry || source === 'gamepad')) onMoreActions?.()
       if (action === 'previous-page' && (!textEntry || source === 'gamepad')) onPreviousPage?.()
@@ -155,8 +201,8 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       if (action === 'next-session' && (!textEntry || source === 'gamepad')) optionsRef.current.onNextSession?.()
       if (action === 'new-session' && (!textEntry || source === 'gamepad')) optionsRef.current.onNewSession?.()
       if (action === 'new-project' && (!textEntry || source === 'gamepad')) optionsRef.current.onNewProject?.()
-      if (action === 'voice-input') optionsRef.current.onVoiceInput?.('press')
-      if (action === 'voice-input-release') optionsRef.current.onVoiceInput?.('release')
+      const voiceInputTrigger = mapVoiceInputTrigger(action, source)
+      if (voiceInputTrigger !== undefined) optionsRef.current.onVoiceInput?.(voiceInputTrigger)
     }
 
     const handleKeyDown = (event: KeyboardEvent): void => {
@@ -186,6 +232,7 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       })
       if (action === undefined) return
       event.preventDefault()
+      if (action === 'voice-input' && event.repeat) return
       handleAction(action, 'keyboard')
     }
 
@@ -195,6 +242,8 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
     }
 
     const handlePointerDown = (event: MouseEvent | PointerEvent): void => {
+      setGamepadMode(false)
+      pointerTargetRef.current = event.target instanceof Element ? event.target : null
       const target = event.target as Element | null
       const focusable = target?.closest<HTMLElement>('[data-focus-id]')
       if (focusable && !focusable.hasAttribute('disabled')) {
@@ -208,16 +257,37 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       }
     }
 
+    const handlePointerMove = (event: PointerEvent): void => {
+      if (lastPointerPosRef.current.x !== -1 && lastPointerPosRef.current.y !== -1) {
+        const dx = Math.abs(event.clientX - lastPointerPosRef.current.x)
+        const dy = Math.abs(event.clientY - lastPointerPosRef.current.y)
+        if (dx > 2 || dy > 2) {
+          setGamepadMode(false)
+          pointerTargetRef.current = event.target instanceof Element ? event.target : null
+          lastPointerPosRef.current = { x: event.clientX, y: event.clientY }
+        }
+      } else {
+        lastPointerPosRef.current = { x: event.clientX, y: event.clientY }
+      }
+    }
+
     const voiceInputButtonIndex = optionsRef.current.voiceInputGamepadButton
-    const mapper = createGamepadMapper(
-      voiceInputButtonIndex === undefined ? {} : { voiceInputButtonIndex },
-    )
+    const screenshotButtonIndex = optionsRef.current.screenshotGamepadButton
+    const mapper = createGamepadMapper({
+      ...(voiceInputButtonIndex !== undefined ? { voiceInputButtonIndex } : {}),
+      ...(screenshotButtonIndex !== undefined ? { screenshotButtonIndex } : {}),
+    })
     let frame = 0
     const pollGamepads = (now: number): void => {
       const gamepad = navigator.getGamepads().find(candidate => candidate?.connected === true)
       if (gamepad === undefined || gamepad === null) {
-        mapper.reset()
+        for (const action of mapper.reset()) handleAction(action, 'gamepad')
       } else {
+        const isInteracting = gamepad.buttons.some(b => b.pressed || b.value > 0.2)
+          || gamepad.axes.some(a => Math.abs(a) > 0.2)
+        if (isInteracting) {
+          setGamepadMode(true)
+        }
         const actions = mapper.update({
           buttons: gamepad.buttons.map(button => button.pressed),
           axes: gamepad.axes,
@@ -227,17 +297,89 @@ export function useSemanticNavigation(options: SemanticNavigationOptions): void 
       frame = requestAnimationFrame(pollGamepads)
     }
 
+    const handlePointerOver = (event: PointerEvent): void => {
+      if (!isGamepadModeRef.current) {
+        pointerTargetRef.current = event.target instanceof Element ? event.target : null
+      }
+    }
+
+    const handlePointerLeave = (): void => {
+      pointerTargetRef.current = null
+    }
+
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('focusin', handleFocusIn)
     window.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerover', handlePointerOver)
+    document.documentElement.addEventListener('pointerleave', handlePointerLeave)
     frame = requestAnimationFrame(pollGamepads)
     return () => {
+      setGamepadMode(false)
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('focusin', handleFocusIn)
       window.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerover', handlePointerOver)
+      document.documentElement.removeEventListener('pointerleave', handlePointerLeave)
       cancelAnimationFrame(frame)
+      for (const action of mapper.reset()) handleAction(action, 'gamepad')
     }
-  }, [options.voiceInputGamepadButton])
+  }, [options.enabled, options.screenshotGamepadButton, options.voiceInputGamepadButton])
+}
+
+export function activateFocusedElement(
+  active: HTMLElement | null,
+  source: InputSource,
+  onOpenSelect?: (select: HTMLSelectElement) => void,
+): void {
+  const textEntry = isTextEntry(active)
+  if (source === 'gamepad' && active instanceof HTMLSelectElement) {
+    onOpenSelect?.(active)
+    return
+  }
+  if (source === 'gamepad' && textEntry && active instanceof HTMLElement) {
+    const form = (active as HTMLInputElement | HTMLTextAreaElement).form
+    if (form) {
+      const submitBtn = form.querySelector<HTMLElement>('button[type="submit"], input[type="submit"]')
+      if (submitBtn && !submitBtn.hasAttribute('disabled')) {
+        submitBtn.click()
+        return
+      }
+    }
+  }
+  if (!textEntry && active instanceof HTMLElement) active.click()
+}
+
+export function adjustSelectValue(select: HTMLSelectElement, direction: -1 | 1): boolean {
+  const options = Array.from(select.options)
+  let index = select.selectedIndex
+  do {
+    index += direction
+  } while (index >= 0 && index < options.length && options[index]?.disabled === true)
+  if (index < 0 || index >= options.length || index === select.selectedIndex) return false
+  select.selectedIndex = index
+  select.dispatchEvent(new Event('input', { bubbles: true }))
+  select.dispatchEvent(new Event('change', { bubbles: true }))
+  return true
+}
+
+export function deleteBackwardFromTextEntry(
+  entry: HTMLInputElement | HTMLTextAreaElement,
+): boolean {
+  if (entry.disabled || entry.readOnly) return false
+  const selectionStart = entry.selectionStart
+  const selectionEnd = entry.selectionEnd
+  if (selectionStart === null || selectionEnd === null) return false
+
+  const deleteStart = selectionStart === selectionEnd
+    ? previousCodePointBoundary(entry.value, selectionStart)
+    : selectionStart
+  if (deleteStart === selectionEnd) return false
+
+  entry.setRangeText('', deleteStart, selectionEnd, 'end')
+  entry.dispatchEvent(new Event('input', { bubbles: true }))
+  return true
 }
 
 export function focusManagedElement(id: string): boolean {
@@ -261,6 +403,23 @@ function isTextEntry(target: EventTarget | null): boolean {
     || target instanceof HTMLSelectElement
 }
 
+function isEditableTextEntry(
+  target: EventTarget | null,
+): target is HTMLInputElement | HTMLTextAreaElement {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+}
+
+function previousCodePointBoundary(value: string, offset: number): number {
+  if (offset === 0) return 0
+  const previous = value.charCodeAt(offset - 1)
+  const beforePrevious = offset > 1 ? value.charCodeAt(offset - 2) : 0
+  const followsHighSurrogate = previous >= 0xdc00
+    && previous <= 0xdfff
+    && beforePrevious >= 0xd800
+    && beforePrevious <= 0xdbff
+  return followsHighSurrogate ? offset - 2 : offset - 1
+}
+
 function isTextNodeId(id: string): boolean {
   return id === 'task-input'
     || id === 'project-name'
@@ -270,7 +429,12 @@ function isTextNodeId(id: string): boolean {
     || id === 'commit-message'
 }
 
-export function scrollVisibleRegion(active: Element | null, delta: number): HTMLElement | undefined {
+export function scrollVisibleRegion(
+  active: Element | null,
+  delta: number,
+  pointerTarget: Element | null = null,
+  horizontalDelta = 0,
+): HTMLElement | undefined {
   const regions = Array.from(document.querySelectorAll<HTMLElement>('[data-scroll-region]'))
     .filter(isVisible)
   if (regions.length === 0) return undefined
@@ -280,37 +444,49 @@ export function scrollVisibleRegion(active: Element | null, delta: number): HTML
   if (overlay && isVisible(overlay)) {
     const overlayRegion = regions.find(region => overlay.contains(region))
     if (overlayRegion !== undefined) {
-      overlayRegion.scrollTop += delta
+      scrollRegionBy(overlayRegion, delta, horizontalDelta)
       return overlayRegion
     }
   }
 
-  // 2. If focus is explicitly within a scroll region (e.g. inspector-files, inspector-diff, task-output)
+  // 2. Route scrolling to the region under the pointer, even when its contents are not focusable.
+  const pointerRegion = pointerTarget?.closest<HTMLElement>('[data-scroll-region]')
+  if (pointerRegion !== null && pointerRegion !== undefined && regions.includes(pointerRegion)) {
+    scrollRegionBy(pointerRegion, delta, horizontalDelta)
+    return pointerRegion
+  }
+
+  // 3. If focus is explicitly within a scroll region (e.g. inspector-files, inspector-diff, task-output)
   const focusedRegion = active?.closest<HTMLElement>('[data-scroll-region]')
   if (focusedRegion !== null && focusedRegion !== undefined && regions.includes(focusedRegion)) {
-    focusedRegion.scrollTop += delta
+    scrollRegionBy(focusedRegion, delta, horizontalDelta)
     return focusedRegion
   }
 
-  // 3. Otherwise in workspace view, prefer the active inspector content region
+  // 4. Otherwise in workspace view, prefer the active inspector content region
   const inspectorContent = regions.find(region => region.dataset.scrollRegion === 'inspector-diff')
     ?? regions.find(region => region.dataset.scrollRegion === 'inspector-activity')
     ?? regions.find(region => region.dataset.scrollRegion === 'inspector-artifacts')
     ?? regions.find(region => region.dataset.scrollRegion === 'inspector-files')
 
   if (inspectorContent !== undefined) {
-    inspectorContent.scrollTop += delta
+    scrollRegionBy(inspectorContent, delta, horizontalDelta)
     return inspectorContent
   }
 
-  // 4. Fallback to task output region or first scroll region
+  // 5. Fallback to task output region or first scroll region
   const outputRegion = regions.find(region => region.dataset.scrollRegion === 'task-output' || region.dataset.scrollRegion === 'task')
   const target = outputRegion ?? regions[0]
   if (target !== undefined) {
-    target.scrollTop += delta
+    scrollRegionBy(target, delta, horizontalDelta)
     return target
   }
   return undefined
+}
+
+function scrollRegionBy(region: HTMLElement, verticalDelta: number, horizontalDelta: number): void {
+  if (verticalDelta !== 0) region.scrollTop += verticalDelta
+  if (horizontalDelta !== 0) region.scrollLeft += horizontalDelta
 }
 
 function isVisible(element: HTMLElement): boolean {

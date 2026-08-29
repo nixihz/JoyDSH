@@ -30,6 +30,8 @@ pub struct KeySimulationCapabilities {
     pub supported: bool,
     pub platform: String,
     pub default_target: VirtualKeyTarget,
+    pub permission_required: bool,
+    pub permission_granted: Option<bool>,
 }
 
 pub fn check_capabilities() -> KeySimulationCapabilities {
@@ -39,6 +41,8 @@ pub fn check_capabilities() -> KeySimulationCapabilities {
             supported: true,
             platform: "macos".into(),
             default_target: VirtualKeyTarget::RightCommand,
+            permission_required: true,
+            permission_granted: None,
         }
     }
     #[cfg(target_os = "windows")]
@@ -47,6 +51,8 @@ pub fn check_capabilities() -> KeySimulationCapabilities {
             supported: true,
             platform: "windows".into(),
             default_target: VirtualKeyTarget::RightControl,
+            permission_required: false,
+            permission_granted: Some(true),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -55,8 +61,39 @@ pub fn check_capabilities() -> KeySimulationCapabilities {
             supported: false,
             platform: "other".into(),
             default_target: VirtualKeyTarget::RightCommand,
+            permission_required: false,
+            permission_granted: None,
         }
     }
+}
+
+pub async fn check_permission(
+    mut capabilities: KeySimulationCapabilities,
+) -> KeySimulationCapabilities {
+    #[cfg(target_os = "macos")]
+    {
+        capabilities.permission_granted =
+            Some(tauri_plugin_macos_permissions::check_accessibility_permission().await);
+    }
+    capabilities
+}
+
+pub async fn request_permission() -> KeySimulationCapabilities {
+    #[cfg(target_os = "macos")]
+    tauri_plugin_macos_permissions::request_accessibility_permission().await;
+
+    check_permission(check_capabilities()).await
+}
+
+pub async fn ensure_permission() -> Result<(), String> {
+    let capabilities = check_permission(check_capabilities()).await;
+    if capabilities.permission_required && capabilities.permission_granted != Some(true) {
+        return Err(
+            "JoyDSH 尚未获得 macOS 辅助功能权限。请在系统设置 > 隐私与安全性 > 辅助功能中允许 JoyDSH。"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn simulate_key(target: &VirtualKeyTarget, action: &KeySimulationAction) -> Result<(), String> {
@@ -88,7 +125,6 @@ mod platform {
     type CGEventTapLocation = u32;
 
     const K_CG_HID_EVENT_TAP: CGEventTapLocation = 0;
-    const K_CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -110,9 +146,9 @@ mod platform {
             VirtualKeyTarget::RightControl => 62, // 0x3E kVK_RightControl
             VirtualKeyTarget::LeftControl => 59,  // 0x3B kVK_Control
             VirtualKeyTarget::Function => 63,     // 0x3F kVK_Function
-            VirtualKeyTarget::F5 => 96,          // 0x60 kVK_F5
-            VirtualKeyTarget::F6 => 97,          // 0x61 kVK_F6
-            VirtualKeyTarget::Space => 49,       // 0x31 kVK_Space
+            VirtualKeyTarget::F5 => 96,           // 0x60 kVK_F5
+            VirtualKeyTarget::F6 => 97,           // 0x61 kVK_F6
+            VirtualKeyTarget::Space => 49,        // 0x31 kVK_Space
             VirtualKeyTarget::Custom(code) => *code,
         }
     }
@@ -124,13 +160,15 @@ mod platform {
                 return Err(format!("无法创建 macOS 按键事件 (keyCode: {key_code})"));
             }
             CGEventPost(K_CG_HID_EVENT_TAP, event);
-            CGEventPost(K_CG_SESSION_EVENT_TAP, event);
             CFRelease(event as *const c_void);
         }
         Ok(())
     }
 
-    pub fn simulate_macos(target: &VirtualKeyTarget, action: &KeySimulationAction) -> Result<(), String> {
+    pub fn simulate_macos(
+        target: &VirtualKeyTarget,
+        action: &KeySimulationAction,
+    ) -> Result<(), String> {
         let key_code = to_macos_key_code(target);
         match action {
             KeySimulationAction::Press => post_key_event(key_code, true),
@@ -152,8 +190,8 @@ mod platform {
     use std::thread;
     use std::time::Duration;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_APPS,
-        VK_F5, VK_F6, VK_LCONTROL, VK_LMENU, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RWIN, VK_SPACE,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_APPS, VK_F5,
+        VK_F6, VK_LCONTROL, VK_LMENU, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RWIN, VK_SPACE,
     };
 
     pub fn to_windows_vk(target: &VirtualKeyTarget) -> u16 {
@@ -191,7 +229,10 @@ mod platform {
         }
     }
 
-    pub fn simulate_windows(target: &VirtualKeyTarget, action: &KeySimulationAction) -> Result<(), String> {
+    pub fn simulate_windows(
+        target: &VirtualKeyTarget,
+        action: &KeySimulationAction,
+    ) -> Result<(), String> {
         let vk = to_windows_vk(target);
         match action {
             KeySimulationAction::Press => post_key_event(vk, true),
@@ -240,7 +281,12 @@ mod tests {
             assert!(caps.supported);
             assert_eq!(caps.platform, "macos");
             assert_eq!(caps.default_target, VirtualKeyTarget::RightCommand);
-            assert_eq!(platform::to_macos_key_code(&VirtualKeyTarget::RightCommand), 54);
+            assert!(caps.permission_required);
+            assert_eq!(caps.permission_granted, None);
+            assert_eq!(
+                platform::to_macos_key_code(&VirtualKeyTarget::RightCommand),
+                54
+            );
             assert_eq!(platform::to_macos_key_code(&VirtualKeyTarget::Function), 63);
         }
     }

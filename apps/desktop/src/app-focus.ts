@@ -14,23 +14,35 @@ export interface AppFocusGraphOptions {
   archiveViewOpen?: boolean
   archivedTaskCount?: number
   canArchiveTask?: boolean
+  permissionConfirmationOpen?: boolean
   artifactConfirmationOpen: boolean
   commitPhase?: 'generating' | 'editing' | 'confirming' | 'committing' | 'failed' | 'completed'
   approvalResponding: boolean
   pendingApprovalCount: number
+  pendingQuestionCount?: number
+  pendingPlanReviewCount?: number
+  pendingResponseKind?: 'question' | 'plan-review'
+  questionOptionCount?: number
+  questionAnswered?: boolean
+  questionHasPrevious?: boolean
+  questionHasNext?: boolean
+  planReviewHasDecline?: boolean
   projectCenterOpen: boolean
   projectPermissionMode: WorkspacePermissionMode
   projectCount: number
   activeProjectIndex?: number
   sessionCount?: number
   activeSessionIndex?: number
+  draftSession?: boolean
   hasWorkspaceBase: boolean
   canCreateProject: boolean
   selectedProvider: 'deepseek-official' | 'openai'
   settingsReady: boolean
   credentialWritable: boolean
   canSaveSettings: boolean
+  voicePermissionActionAvailable?: boolean
   inspectorPage: 'activity' | 'changes' | 'artifacts'
+  inspectorOpen?: boolean
   artifactChangeIds: readonly string[]
   selectedArtifactChangeId?: string
   selectedArtifactAccepted: boolean
@@ -40,20 +52,31 @@ export interface AppFocusGraphOptions {
   canContinueCommit: boolean
   lightboxOpen?: boolean
   pendingAttachmentIds?: readonly string[]
+  gamepadSelectOptionIds?: readonly string[]
+  gamepadSelectSelectedId?: string
 }
 
 export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
+  if ((options.gamepadSelectOptionIds?.length ?? 0) > 0) return createGamepadSelectFocusGraph(options)
   if (options.lightboxOpen) {
     return {
       entryId: 'lightbox-close',
-      nodes: [{ id: 'lightbox-close', group: 'lightbox', order: 0 }],
+      nodes: [
+        { id: 'lightbox-zoom-out', group: 'lightbox', order: 0, neighbors: { right: 'lightbox-reset' } },
+        { id: 'lightbox-reset', group: 'lightbox', order: 1, neighbors: { left: 'lightbox-zoom-out', right: 'lightbox-zoom-in' } },
+        { id: 'lightbox-zoom-in', group: 'lightbox', order: 2, neighbors: { left: 'lightbox-reset', right: 'lightbox-close' } },
+        { id: 'lightbox-close', group: 'lightbox', order: 3, neighbors: { left: 'lightbox-zoom-in' } },
+      ],
     }
   }
   if (options.settingsOpen) return createSettingsFocusGraph(options)
   if (options.projectCenterOpen) return createProjectFocusGraph(options)
   if (options.commandCenterOpen && options.archiveViewOpen) return createArchiveFocusGraph(options.archivedTaskCount ?? 0)
+  if (options.commandCenterOpen && options.permissionConfirmationOpen) return createPermissionConfirmationFocusGraph()
   if (options.commandCenterOpen && options.artifactConfirmationOpen) return createArtifactConfirmationFocusGraph()
   if (options.commandCenterOpen && options.commitPhase !== undefined) return createCommitFocusGraph(options)
+  if (options.commandCenterOpen && options.pendingResponseKind === 'question') return createQuestionFocusGraph(options)
+  if (options.commandCenterOpen && options.pendingResponseKind === 'plan-review') return createPlanReviewFocusGraph(options)
   if (options.commandCenterOpen && options.approvalDetailOpen) return createApprovalFocusGraph(options)
   if (options.commandCenterOpen) return createCommandFocusGraph(options)
 
@@ -63,13 +86,20 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
   const activeSessionIndex = Math.max(0, Math.min(options.activeSessionIndex ?? 0, Math.max(0, sessionCount - 1)))
 
   const activeProjectTabId = projectCount > 0 ? `project-tab-${activeProjectIndex}` : 'project-tab-new'
-  const activeSessionCardId = sessionCount > 0 ? `session-card-${activeSessionIndex}` : 'session-card-new'
+  const activeSessionCardId = options.draftSession === true || sessionCount === 0
+    ? 'session-card-new'
+    : `session-card-${activeSessionIndex}`
   const inspectorTabId = `inspector-tab-${options.inspectorPage}`
-  const firstComposerTarget = options.hasFailureAction
-    ? 'failure-model-settings'
+  const inspectorOpen = options.inspectorOpen !== false
+  const inspectorTargetId = inspectorOpen ? inspectorTabId : 'inspector-toggle'
+  const hasInformationResponse = (options.pendingQuestionCount ?? 0) > 0 || (options.pendingPlanReviewCount ?? 0) > 0
+  const firstComposerTarget = hasInformationResponse
+    ? 'task-response-open'
     : options.pendingApprovalCount > 0
       ? 'task-approval-open'
-      : 'task-input'
+      : options.hasFailureAction
+        ? 'failure-model-settings'
+        : 'task-input'
 
   const topTarget = projectCount > 0 ? activeProjectTabId : (options.hasActiveTask ? firstComposerTarget : 'open-project-center')
   const headerDown = options.busy ? undefined : topTarget
@@ -84,7 +114,7 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
     { id: 'settings-toggle', group: 'header', order: 0, neighbors: settingsNeighbors },
   ]
   if (!options.busy) {
-    const runtimeNeighbors: FocusNode['neighbors'] = { left: 'settings-toggle', right: inspectorTabId }
+    const runtimeNeighbors: FocusNode['neighbors'] = { left: 'settings-toggle', right: 'inspector-toggle' }
     if (headerDown !== undefined) {
       runtimeNeighbors.down = headerDown
       runtimeNeighbors['previous-region'] = headerDown
@@ -125,8 +155,7 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
 
   // Session Sidebar Nodes (Vertical Left Sidebar)
   if (!options.busy && (sessionCount > 0 || projectCount > 0)) {
-    const sessionCardIds = Array.from({ length: sessionCount }, (_, i) => `session-card-${i}`)
-    sessionCardIds.push('session-card-new')
+    const sessionCardIds = ['session-card-new', ...Array.from({ length: sessionCount }, (_, i) => `session-card-${i}`)]
     const firstMainTarget = options.hasActiveTask
       ? firstComposerTarget
       : (projectCount > 0 ? 'empty-new-session' : 'open-project-center')
@@ -160,9 +189,9 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
           up: 'session-card-new',
           left: 'session-card-new',
           right: 'open-project-center',
-          down: inspectorTabId,
+          down: inspectorTargetId,
           'previous-region': 'session-card-new',
-          'next-region': inspectorTabId,
+          'next-region': inspectorTargetId,
         },
       })
       nodes.push({
@@ -172,10 +201,10 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
         neighbors: {
           up: 'session-card-new',
           left: 'empty-new-session',
-          right: inspectorTabId,
-          down: inspectorTabId,
+          right: inspectorTargetId,
+          down: inspectorTargetId,
           'previous-region': 'empty-new-session',
-          'next-region': inspectorTabId,
+          'next-region': inspectorTargetId,
         },
       })
     } else {
@@ -185,9 +214,9 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
         order: 0,
         neighbors: {
           up: 'settings-toggle',
-          right: inspectorTabId,
+          right: inspectorTargetId,
           'previous-region': 'settings-toggle',
-          'next-region': inspectorTabId,
+          'next-region': inspectorTargetId,
         },
       })
     }
@@ -195,14 +224,35 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
 
   if (options.hasActiveTask) {
     const composerUpTarget = sessionCount > 0 ? activeSessionCardId : (projectCount > 0 ? activeProjectTabId : 'settings-toggle')
+    const attachmentActionIds = (options.pendingAttachmentIds ?? []).flatMap(id => [
+      `attachment-preview-${id}`,
+      `attachment-remove-${id}`,
+    ])
+    const toolbarEntryId = options.canPauseTask ? 'pause-task' : 'voice-input'
+    const composerDownTarget = attachmentActionIds[0] ?? toolbarEntryId
+    const toolbarUpTarget = attachmentActionIds.at(-1) ?? 'task-input'
+
+    if (hasInformationResponse) {
+      const responseNeighbors: NonNullable<FocusNode['neighbors']> = {
+        up: composerUpTarget,
+        down: options.pendingApprovalCount > 0
+          ? 'task-approval-open'
+          : options.hasFailureAction ? 'failure-model-settings' : 'task-input',
+        right: inspectorTargetId,
+        'previous-region': composerUpTarget,
+        'next-region': inspectorTargetId,
+      }
+      if (sessionCount > 0) responseNeighbors.left = activeSessionCardId
+      nodes.push({ id: 'task-response-open', group: 'main', order: 0, neighbors: responseNeighbors })
+    }
 
     if (options.pendingApprovalCount > 0) {
       const approvalNeighbors: NonNullable<FocusNode['neighbors']> = {
-        up: composerUpTarget,
+        up: hasInformationResponse ? 'task-response-open' : composerUpTarget,
         down: options.hasFailureAction ? 'failure-model-settings' : 'task-input',
-        right: inspectorTabId,
+        right: inspectorTargetId,
         'previous-region': composerUpTarget,
-        'next-region': inspectorTabId,
+        'next-region': inspectorTargetId,
       }
       if (sessionCount > 0) approvalNeighbors.left = activeSessionCardId
       nodes.push({
@@ -215,11 +265,13 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
 
     if (options.hasFailureAction) {
       const failureNeighbors: NonNullable<FocusNode['neighbors']> = {
-        up: options.pendingApprovalCount > 0 ? 'task-approval-open' : composerUpTarget,
+        up: options.pendingApprovalCount > 0
+          ? 'task-approval-open'
+          : hasInformationResponse ? 'task-response-open' : composerUpTarget,
         down: 'task-input',
-        right: inspectorTabId,
+        right: inspectorTargetId,
         'previous-region': composerUpTarget,
-        'next-region': inspectorTabId,
+        'next-region': inspectorTargetId,
       }
       if (sessionCount > 0) failureNeighbors.left = activeSessionCardId
       nodes.push({
@@ -230,61 +282,85 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
       })
     }
 
-    const inputDown = options.canPauseTask ? 'pause-task' : 'voice-input'
     const inputNeighbors: NonNullable<FocusNode['neighbors']> = {
       up: options.hasFailureAction
         ? 'failure-model-settings'
         : options.pendingApprovalCount > 0
           ? 'task-approval-open'
-          : composerUpTarget,
-      right: inspectorTabId,
+          : hasInformationResponse ? 'task-response-open' : composerUpTarget,
+      right: inspectorTargetId,
       'previous-region': composerUpTarget,
-      'next-region': inspectorTabId,
+      'next-region': inspectorTargetId,
     }
     if (sessionCount > 0) inputNeighbors.left = activeSessionCardId
-    if (inputDown !== undefined) inputNeighbors.down = inputDown
+    inputNeighbors.down = composerDownTarget
     nodes.push({ id: 'task-input', group: 'main', order: 1, neighbors: inputNeighbors })
+
+    for (const [index, id] of attachmentActionIds.entries()) {
+      nodes.push({
+        id,
+        group: 'composer-attachments',
+        order: index,
+        neighbors: {
+          up: 'task-input',
+          down: toolbarEntryId,
+          left: attachmentActionIds[index - 1] ?? (sessionCount > 0 ? activeSessionCardId : 'task-input'),
+          right: attachmentActionIds[index + 1] ?? inspectorTargetId,
+          'previous-region': 'task-input',
+          'next-region': inspectorTargetId,
+        },
+      })
+    }
 
     if (options.canPauseTask) {
       const pauseNeighbors: FocusNode['neighbors'] = {
-        up: 'task-input',
+        up: toolbarUpTarget,
         right: 'voice-input',
         'previous-region': composerUpTarget,
-        'next-region': inspectorTabId,
+        'next-region': inspectorTargetId,
       }
       nodes.push({ id: 'pause-task', group: 'main', order: 2, neighbors: pauseNeighbors })
     }
 
     const voiceNeighbors: FocusNode['neighbors'] = {
-      up: 'task-input',
-      right: 'attach-image',
+      up: toolbarUpTarget,
+      right: 'screenshot-button',
       'previous-region': composerUpTarget,
-      'next-region': inspectorTabId,
+      'next-region': inspectorTargetId,
     }
     if (options.canPauseTask) voiceNeighbors.left = 'pause-task'
     nodes.push({ id: 'voice-input', group: 'main', order: 3, neighbors: voiceNeighbors })
 
-    const attachNeighbors: FocusNode['neighbors'] = {
-      up: 'task-input',
+    const screenshotNeighbors: FocusNode['neighbors'] = {
+      up: toolbarUpTarget,
       left: 'voice-input',
-      right: options.canSend ? 'send-task' : inspectorTabId,
+      right: 'paste-image',
       'previous-region': composerUpTarget,
-      'next-region': inspectorTabId,
+      'next-region': inspectorTargetId,
     }
-    nodes.push({ id: 'attach-image', group: 'main', order: 4, neighbors: attachNeighbors })
+    nodes.push({ id: 'screenshot-button', group: 'main', order: 4, neighbors: screenshotNeighbors })
+
+    const pasteNeighbors: FocusNode['neighbors'] = {
+      up: toolbarUpTarget,
+      left: 'screenshot-button',
+      right: options.canSend ? 'send-task' : inspectorTargetId,
+      'previous-region': composerUpTarget,
+      'next-region': inspectorTargetId,
+    }
+    nodes.push({ id: 'paste-image', group: 'main', order: 5, neighbors: pasteNeighbors })
 
     if (options.canSend) {
       const sendNeighbors: FocusNode['neighbors'] = {
-        up: 'task-input',
-        left: 'attach-image',
-        right: inspectorTabId,
+        up: toolbarUpTarget,
+        left: 'paste-image',
+        right: inspectorTargetId,
         'previous-region': composerUpTarget,
-        'next-region': inspectorTabId,
+        'next-region': inspectorTargetId,
       }
       nodes.push({
         id: 'send-task',
         group: 'main',
-        order: 5,
+        order: 6,
         neighbors: sendNeighbors,
       })
     }
@@ -303,8 +379,22 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
     : `artifact-reject-${options.selectedArtifactChangeId}`
   const headerUpTarget = !options.busy ? 'runtime-toggle' : 'settings-toggle'
 
-  for (const [index, id] of tabIds.entries()) {
-    const leftTarget = index === 0 ? firstComposerTarget : (tabIds[index - 1] ?? firstComposerTarget)
+  nodes.push({
+    id: 'inspector-toggle',
+    group: 'inspector-toggle',
+    order: 0,
+    neighbors: {
+      left: firstComposerTarget,
+      ...(inspectorOpen ? { right: inspectorTabId } : {}),
+      up: headerUpTarget,
+      down: firstComposerTarget,
+      'previous-region': firstComposerTarget,
+      'next-region': inspectorOpen ? inspectorTabId : 'settings-toggle',
+    },
+  })
+
+  for (const [index, id] of (inspectorOpen ? tabIds : []).entries()) {
+    const leftTarget = index === 0 ? 'inspector-toggle' : (tabIds[index - 1] ?? 'inspector-toggle')
     const rightTarget = tabIds[index + 1]
     const neighbors: FocusNode['neighbors'] = {
       left: leftTarget,
@@ -320,7 +410,7 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
     }
     nodes.push({ id, group: 'inspector-tabs', order: index, neighbors })
   }
-  if (options.inspectorPage === 'changes') {
+  if (inspectorOpen && options.inspectorPage === 'changes') {
     for (const [index, id] of fileIds.entries()) {
       const actionTarget = id === selectedFileId && options.canReviewArtifacts
         ? options.selectedArtifactAccepted ? rejectActionId : acceptActionId
@@ -367,11 +457,114 @@ export function createAppFocusGraph(options: AppFocusGraphOptions): FocusGraph {
   return { entryId: defaultEntry, nodes }
 }
 
+function createGamepadSelectFocusGraph(options: AppFocusGraphOptions): FocusGraph {
+  const optionIds = options.gamepadSelectOptionIds ?? []
+  const entryId = options.gamepadSelectSelectedId !== undefined && optionIds.includes(options.gamepadSelectSelectedId)
+    ? options.gamepadSelectSelectedId
+    : optionIds[0] ?? 'gamepad-select-close'
+  const nodes: FocusNode[] = [{
+    id: 'gamepad-select-close',
+    group: 'gamepad-select-header',
+    order: 0,
+    neighbors: optionIds.length === 0 ? {} : { down: entryId, 'next-region': entryId },
+  }]
+  for (const [index, id] of optionIds.entries()) {
+    nodes.push({
+      id,
+      group: 'gamepad-select-options',
+      order: index,
+      neighbors: {
+        up: optionIds[index - 1] ?? 'gamepad-select-close',
+        down: optionIds[index + 1] ?? 'gamepad-select-close',
+        left: 'gamepad-select-close',
+        'previous-region': 'gamepad-select-close',
+      },
+    })
+  }
+  return { entryId, nodes }
+}
+
+function createQuestionFocusGraph(options: AppFocusGraphOptions): FocusGraph {
+  const optionIds = Array.from({ length: options.questionOptionCount ?? 0 }, (_, index) => `question-option-${index}`)
+  const ids = [
+    'question-back',
+    ...optionIds,
+    'question-custom',
+    'question-cancel',
+    ...(options.questionHasPrevious === true ? ['question-previous'] : []),
+    'question-skip',
+    ...(options.questionAnswered === true
+      ? [options.questionHasNext === true ? 'question-next' : 'question-submit']
+      : []),
+  ]
+  const entryId = optionIds[0] ?? 'question-custom'
+  return {
+    entryId,
+    nodes: ids.map((id, index) => ({
+      id,
+      group: id.startsWith('question-option') || id === 'question-custom' ? 'question-answer' : 'question-navigation',
+      order: index,
+      neighbors: {
+        up: ids[index - 1] ?? ids.at(-1) ?? entryId,
+        down: ids[index + 1] ?? ids[0] ?? entryId,
+        ...(id === 'question-submit' || id === 'question-next'
+          ? { left: 'question-skip' }
+          : {}),
+      },
+    })),
+  }
+}
+
+function createPlanReviewFocusGraph(options: AppFocusGraphOptions): FocusGraph {
+  const ids = [
+    'plan-review-back',
+    'plan-review-discuss',
+    ...(options.planReviewHasDecline === true ? ['plan-review-decline'] : []),
+    'plan-review-approve',
+  ]
+  const entryId = options.planReviewHasDecline === true ? 'plan-review-decline' : 'plan-review-discuss'
+  return {
+    entryId,
+    nodes: ids.map((id, index) => ({
+      id,
+      group: id === 'plan-review-back' ? 'plan-review-header' : 'plan-review-actions',
+      order: index,
+      neighbors: {
+        up: id === 'plan-review-back' ? ids.at(-1) ?? entryId : 'plan-review-back',
+        ...(id !== 'plan-review-back' ? { left: ids[index - 1] ?? 'plan-review-back' } : {}),
+        ...(id !== 'plan-review-back' && ids[index + 1] !== undefined ? { right: ids[index + 1] } : {}),
+      },
+    })),
+  }
+}
+
+function createPermissionConfirmationFocusGraph(): FocusGraph {
+  return {
+    entryId: 'permission-cancel',
+    nodes: [
+      {
+        id: 'permission-cancel',
+        group: 'permission-confirmation',
+        order: 0,
+        neighbors: { right: 'permission-confirm' },
+      },
+      {
+        id: 'permission-confirm',
+        group: 'permission-confirmation',
+        order: 1,
+        neighbors: { left: 'permission-cancel' },
+      },
+    ],
+  }
+}
+
 function createCommandFocusGraph(options: AppFocusGraphOptions): FocusGraph {
   const entryId = 'command-current-task'
   const ids = [
     entryId,
     ...(options.pendingApprovalCount > 0 ? ['command-approvals'] : []),
+    ...((options.pendingQuestionCount ?? 0) > 0 ? ['command-questions'] : []),
+    ...((options.pendingPlanReviewCount ?? 0) > 0 ? ['command-plan-reviews'] : []),
     'command-projects',
     ...(options.hasActiveTask ? ['command-toggle-permission'] : []),
     ...(options.hasActiveTask && options.canArchiveTask ? ['command-archive-task'] : []),
@@ -645,7 +838,7 @@ function createSettingsFocusGraph(options: AppFocusGraphOptions): FocusGraph {
     if (options.canSaveSettings) fieldIds.push('settings-save')
     fieldIds.push('voice-input-gamepad-button')
     fieldIds.push('voice-input-key')
-    fieldIds.push('voice-input-mode')
+    if (options.voicePermissionActionAvailable) fieldIds.push('voice-input-permission')
     fieldIds.push('voice-input-test')
   }
   const firstField = fieldIds[0]

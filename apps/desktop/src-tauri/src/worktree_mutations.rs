@@ -5655,8 +5655,16 @@ mod tests {
         fs::write(repository.path().join("second.txt"), "second base\n").unwrap();
         repository.commit_all("initial");
         let baseline = repository.baseline();
-        fs::write(repository.path().join("first.txt"), "first task content changed\n").unwrap();
-        fs::write(repository.path().join("second.txt"), "second task content changed\n").unwrap();
+        fs::write(
+            repository.path().join("first.txt"),
+            "first task content changed\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("second.txt"),
+            "second task content changed\n",
+        )
+        .unwrap();
         let snapshots = repository.snapshots(&baseline);
         let index_before = repository.index_bytes();
 

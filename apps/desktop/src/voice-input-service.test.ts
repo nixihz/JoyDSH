@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import {
   DEFAULT_VOICE_INPUT_CONFIG,
+  gamepadButtonConflict,
   loadVoiceInputConfig,
   saveVoiceInputConfig,
   toVirtualKeyTarget,
@@ -38,8 +39,7 @@ describe('voice-input-service', () => {
     const config = loadVoiceInputConfig()
     expect(config).toEqual(DEFAULT_VOICE_INPUT_CONFIG)
     expect(config.targetKey).toBe('right-command')
-    expect(config.mode).toBe('toggle')
-    expect(config.gamepadButton).toBe(8)
+    expect(config.gamepadButton).toBe(11)
     expect(config.enabled).toBe(true)
   })
 
@@ -47,15 +47,15 @@ describe('voice-input-service', () => {
     const updated: VoiceInputConfig = {
       enabled: true,
       targetKey: 'right-option',
-      mode: 'push-to-talk',
-      gamepadButton: 11,
+      gamepadButton: 8,
       customKeyCode: 61,
     }
     saveVoiceInputConfig(updated)
     expect(loadVoiceInputConfig()).toEqual(updated)
+    expect(JSON.parse(storage['joydsh:voice-input-config'] ?? '{}')).toEqual({ version: 2, ...updated })
   })
 
-  it('为旧配置补充默认手柄触发键', () => {
+  it('迁移旧模式配置并补充新的默认 R3 映射', () => {
     storage['joydsh:voice-input-config'] = JSON.stringify({
       enabled: true,
       targetKey: 'function',
@@ -65,9 +65,30 @@ describe('voice-input-service', () => {
     expect(loadVoiceInputConfig()).toEqual({
       enabled: true,
       targetKey: 'function',
-      mode: 'toggle',
+      gamepadButton: 11,
+    })
+  })
+
+  it('保留已经明确保存的旧手柄映射', () => {
+    storage['joydsh:voice-input-config'] = JSON.stringify({
+      enabled: true,
+      targetKey: 'right-command',
+      mode: 'push-to-talk',
       gamepadButton: 8,
     })
+
+    expect(loadVoiceInputConfig()).toEqual({
+      enabled: true,
+      targetKey: 'right-command',
+      gamepadButton: 8,
+    })
+  })
+
+  it('说明语音映射会替代已有的手柄动作', () => {
+    expect(gamepadButtonConflict(4)).toBe('上一个项目')
+    expect(gamepadButtonConflict(0)).toBe('确认')
+    expect(gamepadButtonConflict(8)).toBeUndefined()
+    expect(gamepadButtonConflict(11)).toBeUndefined()
   })
 
   it('正确映射虚拟按键目标格式', () => {
