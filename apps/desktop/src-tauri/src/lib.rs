@@ -126,6 +126,7 @@ struct RuntimeInfo {
     pid: u32,
     url: String,
     version: &'static str,
+    log_path: PathBuf,
 }
 
 #[derive(Clone, Serialize)]
@@ -145,6 +146,110 @@ struct WorkspaceSelection {
 #[tauri::command]
 fn describe_workspace_catalog(app: tauri::AppHandle) -> Result<WorkspaceCatalogView, String> {
     workspace_catalog_store(&app)?.view()
+}
+
+#[tauri::command]
+fn load_ui_preferences(app: tauri::AppHandle) -> Result<Value, String> {
+    let path = ui_preferences_path(&app)?;
+    Ok(read_ui_preferences(&path))
+}
+
+#[tauri::command]
+fn save_ui_preferences(app: tauri::AppHandle, preferences: Value) -> Result<(), String> {
+    let path = ui_preferences_path(&app)?;
+    write_ui_preferences(&path, &preferences)
+}
+
+#[tauri::command]
+fn pick_background_file(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<PickedBackgroundFile, String> {
+    let source = PathBuf::from(source_path);
+    if !source.is_file() {
+        return Err("背景文件不存在".into());
+    }
+    let metadata = fs::metadata(&source)
+        .map_err(|error| format!("无法读取背景文件元数据：{error}"))?;
+    if metadata.len() == 0 {
+        return Err("背景文件为空".into());
+    }
+    if metadata.len() > 8 * 1024 * 1024 {
+        return Err("背景文件超过 8 MB 上限".into());
+    }
+    copy_background_to_appdir(&app, &source)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PresetBackground {
+    id: String,
+    label: String,
+    data_url: String,
+    mime: String,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn list_preset_backgrounds(app: tauri::AppHandle) -> Result<Vec<PresetBackground>, String> {
+    let mut out = Vec::new();
+    let mut candidate_dirs = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidate_dirs.push(resource_dir.join("backgrounds"));
+        candidate_dirs.push(resource_dir.join("resources").join("backgrounds"));
+    }
+    candidate_dirs.push(PathBuf::from("resources/backgrounds"));
+    candidate_dirs.push(PathBuf::from("apps/desktop/src-tauri/resources/backgrounds"));
+    candidate_dirs.push(PathBuf::from("src-tauri/resources/backgrounds"));
+
+    for dir in candidate_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(read) = fs::read_dir(&dir) {
+            for entry in read.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !matches!(ext.as_str(), "svg" | "png" | "jpg" | "jpeg" | "webp") {
+                    continue;
+                }
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("preset")
+                    .to_string();
+                if out.iter().any(|item: &PresetBackground| item.id == id) {
+                    continue;
+                }
+                let bytes = match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let mime = guess_mime_from_extension(&path);
+                let label = id.replace(['-', '_'], " ");
+                let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
+                out.push(PresetBackground {
+                    id,
+                    label,
+                    data_url,
+                    mime: mime.to_string(),
+                    bytes: bytes.len() as u64,
+                });
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }
 
 #[tauri::command]
@@ -714,6 +819,14 @@ fn start_runtime(
         return Err("工作空间路径不是目录".into());
     }
 
+    let dsh_home = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?
+        .join("dsh");
+    fs::create_dir_all(&dsh_home).map_err(|error| format!("无法创建 DSH 数据目录：{error}"))?;
+    let log_path = dsh_home.join("runtime.log");
+
     let mut child_slot = manager.child.lock().map_err(|_| "运行时状态锁已损坏")?;
     if let Some(child) = child_slot.as_mut() {
         if child
@@ -721,7 +834,7 @@ fn start_runtime(
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            return Ok(runtime_info(child.id()));
+            return Ok(runtime_info(child.id(), log_path));
         }
         *child_slot = None;
     }
@@ -729,15 +842,27 @@ fn start_runtime(
     TcpListener::bind(("127.0.0.1", DSH_PORT))
         .map_err(|_| format!("运行时端口 {DSH_PORT} 已被占用"))?;
 
-    let dsh_home = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?
-        .join("dsh");
-    fs::create_dir_all(&dsh_home).map_err(|error| format!("无法创建 DSH 数据目录：{error}"))?;
-
     let executable = find_dsh_executable()?;
-    let child = Command::new(executable)
+    let node_path = find_node_executable(&app)?;
+    let node_dir = node_path
+        .parent()
+        .ok_or_else(|| format!("无法确定 {} 所在目录", node_path.display()))?;
+    let child_path = build_child_path_env(node_dir)?;
+
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| format!("无法创建运行时日志 {}：{error}", log_path.display()))?;
+    let log_for_diag = log_path.clone();
+    let stdout = Stdio::from(
+        log_file
+            .try_clone()
+            .map_err(|error| format!("无法复制运行时日志句柄：{error}"))?,
+    );
+    let stderr = Stdio::from(log_file);
+
+    let spawn_result = Command::new(&executable)
         .args([
             "--profile",
             "web",
@@ -748,13 +873,24 @@ fn start_runtime(
             "--no-open",
         ])
         .current_dir(workspace)
-        .env("DSH_HOME", dsh_home)
+        .env("DSH_HOME", &dsh_home)
+        .env("PATH", &child_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("无法启动固定版本 DSH：{error}"))?;
-    let info = runtime_info(child.id());
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn();
+    let child = match spawn_result {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(format!(
+                "无法启动固定版本 DSH（{} -> {}）：{error}；详细日志：{}",
+                executable.display(),
+                node_path.display(),
+                log_for_diag.display(),
+            ));
+        }
+    };
+    let info = runtime_info(child.id(), log_path);
     *child_slot = Some(child);
     drop(child_slot);
     start_event_streams(&app, &manager)?;
@@ -764,6 +900,24 @@ fn start_runtime(
 #[tauri::command]
 fn stop_runtime(manager: State<'_, RuntimeManager>) -> Result<(), String> {
     stop_child(&manager)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeLogInfo {
+    log_path: PathBuf,
+}
+
+#[tauri::command]
+fn describe_runtime_log_path(app: tauri::AppHandle) -> Result<RuntimeLogInfo, String> {
+    let dsh_home = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?
+        .join("dsh");
+    Ok(RuntimeLogInfo {
+        log_path: dsh_home.join("runtime.log"),
+    })
 }
 
 #[tauri::command]
@@ -1170,11 +1324,12 @@ async fn forward_event_stream(app: tauri::AppHandle, stream_name: &'static str) 
     }
 }
 
-fn runtime_info(pid: u32) -> RuntimeInfo {
+fn runtime_info(pid: u32, log_path: PathBuf) -> RuntimeInfo {
     RuntimeInfo {
         pid,
         url: format!("http://127.0.0.1:{DSH_PORT}"),
         version: DSH_VERSION,
+        log_path,
     }
 }
 
@@ -1194,6 +1349,134 @@ fn task_artifact_store(app: &tauri::AppHandle) -> Result<TaskArtifactStore, Stri
         .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?
         .join("task-artifacts.json");
     Ok(TaskArtifactStore::new(config_path))
+}
+
+fn ui_preferences_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建 JoyDSH 数据目录：{error}"))?;
+    Ok(dir.join("ui-preferences.json"))
+}
+
+const UI_PREFERENCES_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_ui_preferences(path: &Path) -> Value {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Value::Null,
+        Err(error) => {
+            eprintln!("[ui-preferences] 读取失败：{error}");
+            return Value::Null;
+        }
+    };
+    if bytes.len() as u64 > UI_PREFERENCES_MAX_BYTES {
+        eprintln!(
+            "[ui-preferences] 文件过大（{} bytes），忽略",
+            bytes.len()
+        );
+        return Value::Null;
+    }
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+fn write_ui_preferences(path: &Path, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("序列化 UI 偏好失败：{error}"))?;
+    if bytes.len() as u64 > UI_PREFERENCES_MAX_BYTES {
+        return Err("UI 偏好过大（> 16 MB）".into());
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &bytes).map_err(|error| format!("写入 UI 偏好失败：{error}"))?;
+    fs::rename(&tmp, path).map_err(|error| format!("提交 UI 偏好失败：{error}"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickedBackgroundFile {
+    source_path: PathBuf,
+    stored_path: PathBuf,
+    data_url: String,
+    mime: String,
+}
+
+fn copy_background_to_appdir(
+    app: &tauri::AppHandle,
+    source: &Path,
+) -> Result<PickedBackgroundFile, String> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "背景文件缺少文件名".to_string())?
+        .to_owned();
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法确定 JoyDSH 数据目录：{error}"))?;
+    let backgrounds_dir = data_dir.join("backgrounds");
+    fs::create_dir_all(&backgrounds_dir)
+        .map_err(|error| format!("无法创建背景目录：{error}"))?;
+    let stored_path = backgrounds_dir.join(&file_name);
+    fs::copy(source, &stored_path)
+        .map_err(|error| format!("无法复制背景文件：{error}"))?;
+    let bytes = fs::read(&stored_path)
+        .map_err(|error| format!("无法读取背景文件：{error}"))?;
+    let mime = guess_mime_from_extension(&stored_path);
+    let encoded = base64_encode(&bytes);
+    let data_url = format!("data:{};base64,{}", mime, encoded);
+    Ok(PickedBackgroundFile {
+        source_path: source.to_path_buf(),
+        stored_path,
+        data_url,
+        mime: mime.to_string(),
+    })
+}
+
+fn guess_mime_from_extension(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push('=');
+    }
+    out
 }
 
 fn acquire_app_instance_guard(app: &tauri::AppHandle) -> Result<AppInstanceGuard, String> {
@@ -1245,6 +1528,94 @@ fn find_dsh_executable() -> Result<PathBuf, String> {
     Err("找不到固定版本 DSH，可通过 JOYDSH_DSH_BIN 指定可执行文件".into())
 }
 
+fn bundled_node_dir() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("windows", "x86_64") => "win-x64",
+        ("windows", "aarch64") => "win-arm64",
+        _ => "unknown",
+    }
+}
+
+fn node_executable_name() -> &'static str {
+    if cfg!(windows) { "node.exe" } else { "node" }
+}
+
+/// Locate a `node` binary in this order:
+/// 1. `JOYDSH_NODE_BIN` env override (escape hatch for both dev and prod).
+/// 2. Bundled resource (`resources/node/<plat>-<arch>/node[.exe]`) for production builds.
+/// 3. `node` in the inherited `PATH`.
+/// 4. A small list of well-known install locations (Homebrew/Linuxbrew/Volta/ASDF).
+///
+/// This exists because the dsh shim is a pnpm-style shell script that does
+/// `exec node "$@"`; on macOS .app bundles the inherited PATH is the launchd
+/// default and does not include the user's node install, so the shim dies
+/// with `node: not found` and the runtime appears to time out.
+fn find_node_executable(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("JOYDSH_NODE_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir
+            .join("node")
+            .join(bundled_node_dir())
+            .join(node_executable_name());
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Some(path) = find_in_path(node_executable_name()) {
+        return Ok(path);
+    }
+
+    let well_known: &[&str] = &[
+        "/opt/homebrew/bin/node",
+        "/opt/homebrew/opt/node@22/bin/node",
+        "/opt/homebrew/opt/node@20/bin/node",
+        "/usr/local/bin/node",
+        "/opt/homebrew/opt/node/bin/node",
+        "/usr/bin/node",
+    ];
+    for path_str in well_known {
+        let path = PathBuf::from(path_str);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    Err(format!(
+        "找不到 {0} 可执行文件；可通过 JOYDSH_NODE_BIN 指定绝对路径，或在构建前运行 pnpm setup:node 下载内嵌版本",
+        node_executable_name()
+    ))
+}
+
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path_var) {
+        let candidate = entry.join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn build_child_path_env(node_dir: &Path) -> Result<std::ffi::OsString, String> {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut segments: Vec<PathBuf> = Vec::with_capacity(8);
+    segments.push(node_dir.to_path_buf());
+    segments.extend(std::env::split_paths(&existing));
+    std::env::join_paths(segments).map_err(|error| format!("无法构造 PATH：{error}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1260,7 +1631,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_runtime,
             stop_runtime,
+            describe_runtime_log_path,
             dsh_rpc,
+            load_ui_preferences,
+            save_ui_preferences,
+            pick_background_file,
+            list_preset_backgrounds,
             describe_workspace_catalog,
             set_workspace_base,
             create_workspace_project,
@@ -1921,5 +2297,29 @@ mod tests {
                 changes: vec![],
             },
         }
+    }
+
+    #[test]
+    fn ui_preferences_supports_large_image_payloads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ui-preferences.json");
+
+        // 构造一个 500 KB 的图片 dataUrl 偏好配置
+        let large_data = "A".repeat(500 * 1024);
+        let value = serde_json::json!({
+            "theme": "dark",
+            "background": {
+                "kind": "image",
+                "value": format!("data:image/png;base64,{large_data}"),
+                "blur": 4,
+                "opacity": 0.8
+            }
+        });
+
+        assert!(write_ui_preferences(&path, &value).is_ok());
+        let read = read_ui_preferences(&path);
+        assert_eq!(read["theme"], "dark");
+        assert_eq!(read["background"]["kind"], "image");
+        assert_eq!(read["background"]["blur"], 4);
     }
 }

@@ -4,9 +4,9 @@
   "version": "0.0.0",
   "identifier": "com.joydsh.desktop",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "pnpm -w dev:web",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm -w setup:node && pnpm -w --filter @joydsh/desktop build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -26,6 +26,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "resources/node/": "node",
+      "resources/backgrounds/": "backgrounds"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

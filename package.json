@@ -8,6 +8,7 @@
     "build:app": "pnpm --filter @joydsh/desktop build:app",
     "dev": "pnpm --filter @joydsh/desktop tauri dev",
     "dev:web": "pnpm --filter @joydsh/desktop dev",
+    "setup:node": "node scripts/install-node.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "pnpm -r --if-present typecheck"
