@@ -843,7 +843,7 @@ function createSettingsFocusGraph(options: AppFocusGraphOptions): FocusGraph {
   }
   const firstField = fieldIds[0]
   const providerBaseNeighbors = (side: 'left' | 'right', target: string): NonNullable<FocusNode['neighbors']> => {
-    const value: NonNullable<FocusNode['neighbors']> = { [side]: target, up: 'settings-close' }
+    const value: NonNullable<FocusNode['neighbors']> = { [side]: target, up: 'settings-tab-model' }
     if (firstField !== undefined) {
       value.down = firstField
       value['next-region'] = firstField
@@ -855,7 +855,25 @@ function createSettingsFocusGraph(options: AppFocusGraphOptions): FocusGraph {
       id: 'settings-close',
       group: 'settings-header',
       order: 0,
-      neighbors: { down: selectedProviderId, 'next-region': selectedProviderId },
+      neighbors: { left: 'settings-tab-appearance', down: selectedProviderId, 'next-region': selectedProviderId },
+    },
+    {
+      id: 'settings-tab-model',
+      group: 'settings-tabs',
+      order: 0,
+      neighbors: { right: 'settings-tab-input', down: selectedProviderId, up: 'settings-close', 'next-region': selectedProviderId },
+    },
+    {
+      id: 'settings-tab-input',
+      group: 'settings-tabs',
+      order: 1,
+      neighbors: { left: 'settings-tab-model', right: 'settings-tab-appearance', down: 'voice-input-gamepad-button', up: 'settings-close' },
+    },
+    {
+      id: 'settings-tab-appearance',
+      group: 'settings-tabs',
+      order: 2,
+      neighbors: { left: 'settings-tab-input', right: 'settings-close', down: 'appearance-theme-dark', up: 'settings-close' },
     },
     {
       id: 'provider-deepseek-official',

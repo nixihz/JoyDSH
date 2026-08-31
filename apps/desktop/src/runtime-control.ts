@@ -2,6 +2,7 @@ export interface ManagedRuntime {
   pid: number
   url: string
   version: string
+  logPath: string
 }
 
 declare global {
@@ -24,5 +25,16 @@ export async function stopManagedRuntime(): Promise<void> {
   if (!isTauri()) throw new Error('浏览器预览不能停止本地运行时，请使用 Tauri 桌面应用')
   const { invoke } = await import('@tauri-apps/api/core')
   await invoke('stop_runtime')
+}
+
+export async function describeRuntimeLogPath(): Promise<string | undefined> {
+  if (!isTauri()) return undefined
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const value = await invoke<{ logPath: string } | null>('describe_runtime_log_path')
+    return value?.logPath
+  } catch {
+    return undefined
+  }
 }
 

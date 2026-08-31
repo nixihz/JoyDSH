@@ -26,6 +26,7 @@ import {
 import {
   Archive,
   ArchiveRestore,
+  ArrowDown,
   ArrowLeft,
   Camera,
   Check,
@@ -48,6 +49,11 @@ import {
   Maximize,
   Mic,
   Minimize,
+  Monitor,
+  MonitorSmartphone,
+  Moon,
+  PaintBucket,
+  Palette,
   PanelRightClose,
   PanelRightOpen,
   Plus,
@@ -81,6 +87,7 @@ import { createAppFocusGraph } from './app-focus.ts'
 import { createLatestSelection } from './latest-selection.ts'
 import { approvalEvidence } from './approval-evidence.ts'
 import { subscribeFullscreenChange, toggleWindowFullscreen } from './fullscreen-service.ts'
+import { useOutputScroll } from './output-scroll.ts'
 import {
   ArtifactOperationException,
   artifactUnavailableReason,
@@ -94,7 +101,9 @@ import {
   type TaskCommitProposal,
 } from './artifact-service.ts'
 import { ProjectCenter } from './ProjectCenter.tsx'
-import { startManagedRuntime, stopManagedRuntime } from './runtime-control.ts'
+import { SettingsCenter } from './SettingsCenter.tsx'
+import { startManagedRuntime, stopManagedRuntime, describeRuntimeLogPath, isTauri } from './runtime-control.ts'
+import { useUiPreferences, UI_PREFERENCE_LIMITS, type ThemeMode, type BackgroundConfig, type PresetBackground } from './ui-preferences.ts'
 import { focusManagedElement, restoreManagedFocus, useSemanticNavigation } from './semantic-navigation.ts'
 import {
   chooseWorkspaceDirectory,
@@ -196,6 +205,7 @@ type ArtifactCommitFlow =
 
 export function App() {
   const adapter = useMemo(createRuntimeAdapter, [])
+  const { preferences: uiPreferences, setTheme: setUiTheme, setBackground: setUiBackground, resetBackground: resetUiBackground } = useUiPreferences()
   const [connection, setConnection] = useState<RuntimeConnectionState>('disconnected')
   const [workspacePath, setWorkspacePath] = useState('')
   const [taskInput, setTaskInput] = useState('')
@@ -262,6 +272,11 @@ export function App() {
   const [voicePermissionBusy, setVoicePermissionBusy] = useState(false)
   const [pendingImages, setPendingImages] = useState<ImageAttachmentInput[]>([])
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null)
+  const [appearanceColorDraft, setAppearanceColorDraft] = useState('#1f3a52')
+  const [appearanceGradientDraft, setAppearanceGradientDraft] = useState('linear-gradient(135deg, #0e8fa6 0%, #2e9c4a 100%)')
+  const [appearancePresets, setAppearancePresets] = useState<PresetBackground[]>([])
+  const [appearanceBusy, setAppearanceBusy] = useState(false)
+  const [appearanceError, setAppearanceError] = useState<string | undefined>()
   const [screenshotBusy, setScreenshotBusy] = useState(false)
   const [gamepadSelect, setGamepadSelect] = useState<GamepadSelectSession | null>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
@@ -283,6 +298,46 @@ export function App() {
     setVoiceCapabilities(capabilities)
     return capabilities
   }, [])
+
+  const loadAppearancePresets = useCallback(async () => {
+    if (!isTauri()) {
+      setAppearancePresets([])
+      return
+    }
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const list = await invoke<PresetBackground[]>('list_preset_backgrounds')
+      setAppearancePresets(list)
+    } catch (error) {
+      setAppearancePresets([])
+      setAppearanceError(`无法读取预设背景：${errorMessage(error)}`)
+    }
+  }, [])
+
+  const pickCustomBackground = useCallback(async () => {
+    if (!isTauri()) return
+    setAppearanceBusy(true)
+    setAppearanceError(undefined)
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog')
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        title: '选择背景图片',
+        filters: [
+          { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+        ],
+      })
+      if (typeof selected !== 'string') return
+      const { invoke } = await import('@tauri-apps/api/core')
+      const picked = await invoke<{ dataUrl: string }>('pick_background_file', { sourcePath: selected })
+      setUiBackground(current => ({ ...current, kind: 'image', value: picked.dataUrl }))
+    } catch (error) {
+      setAppearanceError(errorMessage(error))
+    } finally {
+      setAppearanceBusy(false)
+    }
+  }, [setUiBackground])
   const commitAttemptRef = useRef(0)
   const previousArtifactStatusRef = useRef<TaskProjection['status'] | undefined>(undefined)
   const taskSelectionRef = useRef(createLatestSelection())
@@ -391,6 +446,16 @@ export function App() {
       return true
     })
   }, [projection?.messages])
+
+  const {
+    isScrolledToBottom,
+    scrollToBottom: scrollOutputToBottom,
+    handleScroll: handleOutputScroll,
+    resetToBottom: resetOutputScroll,
+  } = useOutputScroll(outputSurfaceRef, {
+    activeTaskId: activeTask?.id,
+    dependencies: [projection?.output, projection?.status, projection?.messages],
+  })
 
   const appendEvent = useCallback((event: TaskEvent) => {
     if (event.taskId !== undefined) {
@@ -599,12 +664,6 @@ export function App() {
   }, [refreshVoiceCapabilities])
 
   useEffect(() => {
-    if (outputSurfaceRef.current) {
-      outputSurfaceRef.current.scrollTop = outputSurfaceRef.current.scrollHeight
-    }
-  }, [projection?.output, projection?.status, projection?.messages])
-
-  useEffect(() => {
     projectTrackRef.current
       ?.querySelector<HTMLElement>('[aria-selected="true"]')
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
@@ -633,6 +692,7 @@ export function App() {
     setSettingsMessage(undefined)
     setSettingsBusy(true)
     void refreshVoiceCapabilities()
+    void loadAppearancePresets()
     void Promise.all([
       adapter.describeCredential(PROVIDERS['deepseek-official'].credentialRef),
       adapter.describeCredential(PROVIDERS.openai.credentialRef),
@@ -644,7 +704,7 @@ export function App() {
       })
       .catch(cause => setSettingsError(errorMessage(cause)))
       .finally(() => setSettingsBusy(false))
-  }, [adapter, refreshVoiceCapabilities])
+  }, [adapter, loadAppearancePresets, refreshVoiceCapabilities])
 
   const openSettings = useCallback(() => {
     if (document.activeElement instanceof HTMLElement) {
@@ -960,7 +1020,14 @@ export function App() {
           // Runtime startup is bounded by the loop.
         }
       }
-      if (!runtimeReady) throw new Error('运行时启动超时')
+      if (!runtimeReady) {
+        const logHint = await describeRuntimeLogPath().catch(() => undefined)
+        throw new Error(
+          logHint
+            ? `运行时启动超时；详细日志：${logHint}`
+            : '运行时启动超时',
+        )
+      }
       setConnection('connected')
     }
   }, [adapter])
@@ -1386,6 +1453,7 @@ export function App() {
 
     setSendBusy(true)
     setError(undefined)
+    resetOutputScroll(false)
 
     void (async () => {
       let currentTask = activeTask
@@ -1490,7 +1558,7 @@ export function App() {
         setSendBusy(false)
       }
     })()
-  }, [activeTask, adapter, connection, ensureRuntimeReady, loadTaskArtifacts, openProjectCenter, pendingImages, projectPermissionMode, sendBusy, taskInput, updateComposingNewSession, workspaceCatalog.projects, workspacePath])
+  }, [activeTask, adapter, connection, ensureRuntimeReady, loadTaskArtifacts, openProjectCenter, pendingImages, projectPermissionMode, resetOutputScroll, sendBusy, taskInput, updateComposingNewSession, workspaceCatalog.projects, workspacePath])
 
   const handleVoiceInputTrigger = useCallback((action: 'tap' | 'press' | 'release' = 'tap') => {
     if (!voiceConfig.enabled) return
@@ -2105,6 +2173,16 @@ export function App() {
       onDrop={handleDrop}
       onPaste={handlePaste}
     >
+      <div
+        className="app-shell__background"
+        data-bg-kind={uiPreferences.background.kind}
+        aria-hidden="true"
+      />
+      <div
+        className="app-shell__scrim"
+        style={{ opacity: uiPreferences.background.kind === 'none' ? 0 : 1 }}
+        aria-hidden="true"
+      />
       {isDraggingOver ? (
         <div className="window-drop-overlay" aria-hidden="true">
           <ImageIcon aria-hidden="true" className="composer-drop-icon" />
@@ -2120,7 +2198,15 @@ export function App() {
         {/* PS5 Project Bar (Top Ribbon) */}
         {workspaceCatalog.projects.length > 0 ? (
           <div className="ps5-project-bar" role="tablist" aria-label="项目列表">
-            <span className="ps5-bumper-badge" title="按 L1 切换前一个项目"><kbd>L1</kbd></span>
+            <kbd
+              className="ps5-bumper-badge"
+              title="按 L1 切换前一个项目"
+              onClick={handlePreviousProject}
+              role="button"
+              tabIndex={-1}
+            >
+              L1
+            </kbd>
             <div
               ref={projectTrackRef}
               className="ps5-project-track"
@@ -2184,7 +2270,15 @@ export function App() {
                 <span>管理工作区</span>
               </button>
             </div>
-            <span className="ps5-bumper-badge" title="按 R1 切换后一个项目"><kbd>R1</kbd></span>
+            <kbd
+              className="ps5-bumper-badge"
+              title="按 R1 切换后一个项目"
+              onClick={handleNextProject}
+              role="button"
+              tabIndex={-1}
+            >
+              R1
+            </kbd>
           </div>
         ) : null}
 
@@ -2193,7 +2287,7 @@ export function App() {
             <span className="state-dot" />
             {connectionLabel(connection)}
           </div>
-          <button data-focus-id="settings-toggle" className="icon-button icon-button--quiet" type="button" onClick={openSettings} title="模型设置" aria-label="打开模型设置">
+          <button data-focus-id="settings-toggle" className="icon-button icon-button--quiet" type="button" onClick={openSettings} title="系统设置" aria-label="打开系统设置">
             <KeyRound aria-hidden="true" />
           </button>
           {connected ? (
@@ -2417,7 +2511,8 @@ export function App() {
                     </ol>
                   </section>
                 ) : null}
-                <div className={`output-surface${projection?.failure === undefined ? '' : ' output-surface--error'}`} ref={outputSurfaceRef} data-scroll-region="task-output" aria-live="polite">
+                <div className="output-surface-container">
+                  <div className={`output-surface${projection?.failure === undefined ? '' : ' output-surface--error'}`} ref={outputSurfaceRef} data-scroll-region="task-output" aria-live="polite" onScroll={handleOutputScroll}>
                   {conversationMessages.length > 0 ? (
                     <div className="conversation-stream">
                       {conversationMessages.map((msg, index) => {
@@ -2570,7 +2665,23 @@ export function App() {
                     </div>
                   )}
                 </div>
-                {composerForm}
+                {!isScrolledToBottom ? (
+                  <button
+                    className="scroll-to-bottom-button"
+                    type="button"
+                    onClick={() => scrollOutputToBottom(true)}
+                    aria-label="回到底部"
+                    title="回到底部"
+                  >
+                    <ArrowDown aria-hidden="true" />
+                    <span>回到底部</span>
+                    {projection?.status === 'running' ? (
+                      <span className="scroll-to-bottom-button__pulse" />
+                    ) : null}
+                  </button>
+                ) : null}
+              </div>
+              {composerForm}
               </div>
             )}
           </div>
@@ -2950,7 +3061,7 @@ export function App() {
                   </button>
                   <button data-focus-id="command-model-settings" className="command-item" type="button" onClick={openSettingsFromCommand}>
                     <KeyRound aria-hidden="true" />
-                    <span><strong>模型设置</strong><small>{PROVIDERS[selectedProvider].name} · {selectedProvider === 'openai' ? selectedModel : PROVIDERS[selectedProvider].defaultModel}</small></span>
+                    <span><strong>系统设置</strong><small>{PROVIDERS[selectedProvider].name} · {selectedProvider === 'openai' ? selectedModel : PROVIDERS[selectedProvider].defaultModel}</small></span>
                   </button>
                 </div>
               </>
@@ -3024,247 +3135,89 @@ export function App() {
       ) : null}
 
       {settingsOpen ? (
-        <div className="settings-overlay" role="presentation" onMouseDown={event => {
-          if (event.currentTarget === event.target) closeSettings()
-        }}>
-          <section className="settings-view" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <header className="settings-header">
-              <div>
-                <span className="step-label">模型连接</span>
-                <h2 id="settings-title">模型设置</h2>
-              </div>
-              <button data-focus-id="settings-close" className="icon-button icon-button--quiet" type="button" onClick={closeSettings} title="关闭" aria-label="关闭模型设置">
-                <X aria-hidden="true" />
-              </button>
-            </header>
-
-            <div className="settings-body" data-scroll-region="settings">
-              <div className="provider-segment" role="group" aria-label="模型提供方">
-                {(Object.keys(PROVIDERS) as ModelProvider[]).map(id => (
-                  <button
-                    key={id}
-                    data-focus-id={`provider-${id}`}
-                    type="button"
-                    className={selectedProvider === id ? 'provider-segment__item provider-segment__item--active' : 'provider-segment__item'}
-                    aria-pressed={selectedProvider === id}
-                    onClick={() => {
-                      setSelectedProvider(id)
-                      setApiKeyDraft('')
-                      setShowApiKey(false)
-                      setSettingsError(undefined)
-                      setSettingsMessage(undefined)
-                    }}
-                  >
-                    {PROVIDERS[id].name}
-                  </button>
-                ))}
-              </div>
-
-              {settingsBusy && credentialStatus === undefined ? (
-                <p className="settings-loading">正在读取配置状态...</p>
-              ) : credentialStatus !== undefined ? (
-                <form className="credential-form" onSubmit={event => { event.preventDefault(); handleApplyModel() }}>
-                  <div className={credentialStatus.configured ? 'credential-state credential-state--ready' : 'credential-state'}>
-                    <span className="state-dot" />
-                    <div>
-                      <strong>{credentialStatus.source === 'env' ? '已由启动环境配置' : credentialStatus.configured ? '凭据已保存' : '尚未配置凭据'}</strong>
-                      <p>
-                        {credentialStatus.source === 'env'
-                          ? `JoyDSH 已检测到 ${provider.credentialRef}，密钥不会显示在界面中。`
-                          : `凭据只会写入 DSH 的 ${provider.credentialRef} 存储，保存后不会回显。`}
-                      </p>
-                    </div>
-                  </div>
-
-                  {credentialStatus.writable ? (
-                    <>
-                      <label htmlFor="api-key">{provider.name} API Key</label>
-                      <div className="secret-entry">
-                        <input
-                          data-focus-id="api-key"
-                          id="api-key"
-                          type={showApiKey ? 'text' : 'password'}
-                          value={apiKeyDraft}
-                          onChange={event => {
-                            setApiKeyDraft(event.target.value)
-                            setSettingsError(undefined)
-                          }}
-                          placeholder={credentialStatus.configured ? '留空以保留现有 Key' : `输入 ${provider.name} API Key`}
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
-                        <button data-focus-id="api-key-visibility" className="icon-button icon-button--quiet" type="button" onClick={() => setShowApiKey(value => !value)} title={showApiKey ? '隐藏 API Key' : '显示 API Key'} aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}>
-                          {showApiKey ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
-                        </button>
-                      </div>
-                    </>
-                  ) : null}
-
-                  <div className="model-field">
-                    <label htmlFor="base-url">Base URL</label>
-                    <input
-                      data-focus-id="base-url"
-                      id="base-url"
-                      value={baseUrlDraft}
-                      onChange={event => {
-                        setBaseUrlDrafts(current => ({
-                          ...current,
-                          [selectedProvider]: event.target.value,
-                        }))
-                        setSettingsError(undefined)
-                      }}
-                      placeholder="留空使用官方地址"
-                      inputMode="url"
-                      autoCapitalize="none"
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                    <p>可填写兼容服务或代理地址；清空后恢复默认地址。</p>
-                  </div>
-
-                  {selectedProvider === 'openai' ? (
-                    <div className="model-field">
-                      <label htmlFor="codex-model">Codex 模型</label>
-                      <input
-                        data-focus-id="codex-model"
-                        id="codex-model"
-                        value={selectedModel}
-                        onChange={event => {
-                          setSelectedModel(event.target.value)
-                          setSettingsError(undefined)
-                        }}
-                        placeholder="例如 gpt-5.6-sol"
-                        autoCapitalize="none"
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                      <p>使用 OpenAI Platform API 计费，不消耗 ChatGPT 套餐额度。</p>
-                    </div>
-                  ) : null}
-
-                  <button data-focus-id="settings-save" className="button button--primary button--tv settings-save" type="submit" disabled={settingsBusy || !canApplyModel}>
-                    <KeyRound aria-hidden="true" />
-                    保存并使用
-                  </button>
-                </form>
-              ) : null}
-
-              <div className="settings-section">
-                <div className="settings-section__header">
-                  <span className="step-label">外设与输入法</span>
-                  <h3>语音输入与按键映射</h3>
-                  <p>指定手柄触发键，并通过底层按键模拟联动 Spokenly、Superwhisper 或系统听写。</p>
-                </div>
-                {voiceCapabilities?.permissionRequired === true ? (
-                  voiceCapabilities.permissionGranted === true ? (
-                    <div className="voice-permission-state voice-permission-state--granted" role="status">
-                      <ShieldCheck aria-hidden="true" />
-                      <span>macOS 辅助功能权限已授权。</span>
-                    </div>
-                  ) : (
-                    <div className="voice-permission-state voice-permission-state--denied" role="alert">
-                      <ShieldAlert aria-hidden="true" />
-                      <div>
-                        <strong>需要辅助功能权限</strong>
-                        <p>请在“系统设置 &gt; 隐私与安全性 &gt; 辅助功能”中允许 JoyDSH，然后返回此窗口。</p>
-                      </div>
-                      <button
-                        data-focus-id="voice-input-permission"
-                        type="button"
-                        className="button button--secondary"
-                        disabled={voicePermissionBusy}
-                        onClick={async () => {
-                          setVoicePermissionBusy(true)
-                          setVoiceTestStatus(undefined)
-                          try {
-                            const capabilities = await requestKeySimulationPermission()
-                            setVoiceCapabilities(capabilities)
-                            setVoiceTestStatus(capabilities.permissionGranted === true
-                              ? '辅助功能权限已授权'
-                              : '请在系统设置中打开 JoyDSH 的辅助功能权限')
-                          } catch (err) {
-                            setVoiceTestStatus(`权限申请失败：${errorMessage(err)}`)
-                          } finally {
-                            setVoicePermissionBusy(false)
-                          }
-                        }}
-                      >
-                        <ShieldCheck aria-hidden="true" />
-                        {voicePermissionBusy ? '等待系统授权…' : '授权辅助功能'}
-                      </button>
-                    </div>
-                  )
-                ) : null}
-                <div className="model-field">
-                  <label htmlFor="voice-input-gamepad-button">手柄触发键</label>
-                  <select
-                    data-focus-id="voice-input-gamepad-button"
-                    id="voice-input-gamepad-button"
-                    value={voiceConfig.gamepadButton}
-                    onChange={event => {
-                      const next = { ...voiceConfig, gamepadButton: Number(event.target.value) as VoiceInputGamepadButton }
-                      setVoiceConfig(next)
-                      saveVoiceInputConfig(next)
-                      setVoiceTestStatus(undefined)
-                    }}
-                  >
-                    {GAMEPAD_BUTTON_OPTIONS.map(option => (
-                      <option key={option.index} value={option.index}>{option.label}</option>
-                    ))}
-                  </select>
-                  {voiceGamepadConflict === undefined ? null : (
-                    <p className="input-mapping-warning" role="status">
-                      语音输入将替代该键原有的“{voiceGamepadConflict}”动作。
-                    </p>
-                  )}
-                </div>
-                <div className="model-field">
-                  <label htmlFor="voice-input-key">听写软件触发键</label>
-                  <select
-                    data-focus-id="voice-input-key"
-                    id="voice-input-key"
-                    value={voiceConfig.targetKey}
-                    onChange={event => {
-                      const next = { ...voiceConfig, targetKey: event.target.value as VoiceInputTargetKey }
-                      setVoiceConfig(next)
-                      saveVoiceInputConfig(next)
-                      setVoiceTestStatus(undefined)
-                    }}
-                  >
-                    {TARGET_KEY_OPTIONS.map(opt => (
-                      <option key={opt.key} value={opt.key}>{opt.label} — {opt.description}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="voice-test-actions">
-                  <button
-                    data-focus-id="voice-input-test"
-                    type="button"
-                    className="button button--secondary"
-                    disabled={voiceCapabilities?.permissionRequired === true && voiceCapabilities.permissionGranted !== true}
-                    onClick={async () => {
-                      try {
-                        await simulateKeyAction(voiceConfig.targetKey, 'tap', voiceConfig.customKeyCode)
-                        setVoiceTestStatus(`已发送模拟按键：${voiceConfig.targetKey}`)
-                      } catch (err) {
-                        setVoiceTestStatus(`模拟失败：${errorMessage(err)}`)
-                      }
-                    }}
-                  >
-                    <Mic aria-hidden="true" />
-                    测试模拟按键
-                  </button>
-                  {voiceTestStatus !== undefined ? (
-                    <span className="voice-test-status">{voiceTestStatus}</span>
-                  ) : null}
-                </div>
-              </div>
-
-              {settingsError === undefined ? null : <div className="inline-error" role="alert">{settingsError}</div>}
-              {settingsMessage === undefined ? null : <div className="inline-success" role="status">{settingsMessage}</div>}
-            </div>
-          </section>
-        </div>
+        <SettingsCenter
+          selectedProvider={selectedProvider}
+          selectedModel={selectedModel}
+          credentialStatus={credentialStatus}
+          apiKeyDraft={apiKeyDraft}
+          baseUrlDraft={baseUrlDraft}
+          showApiKey={showApiKey}
+          canApplyModel={canApplyModel}
+          settingsBusy={settingsBusy}
+          onSelectProvider={id => {
+            setSelectedProvider(id)
+            setApiKeyDraft('')
+            setShowApiKey(false)
+            setSettingsError(undefined)
+            setSettingsMessage(undefined)
+          }}
+          onChangeApiKeyDraft={value => {
+            setApiKeyDraft(value)
+            setSettingsError(undefined)
+          }}
+          onToggleShowApiKey={() => setShowApiKey(value => !value)}
+          onChangeBaseUrlDraft={value => {
+            setBaseUrlDrafts(current => ({
+              ...current,
+              [selectedProvider]: value,
+            }))
+            setSettingsError(undefined)
+          }}
+          onChangeSelectedModel={value => {
+            setSelectedModel(value)
+            setSettingsError(undefined)
+          }}
+          onApplyModel={handleApplyModel}
+          voiceConfig={voiceConfig}
+          voiceCapabilities={voiceCapabilities}
+          voicePermissionBusy={voicePermissionBusy}
+          voiceTestStatus={voiceTestStatus}
+          voiceGamepadConflict={voiceGamepadConflict}
+          onChangeVoiceConfig={updater => {
+            const next = updater(voiceConfig)
+            setVoiceConfig(next)
+            saveVoiceInputConfig(next)
+            setVoiceTestStatus(undefined)
+          }}
+          onRequestVoicePermission={async () => {
+            setVoicePermissionBusy(true)
+            setVoiceTestStatus(undefined)
+            try {
+              const capabilities = await requestKeySimulationPermission()
+              setVoiceCapabilities(capabilities)
+              setVoiceTestStatus(capabilities.permissionGranted === true
+                ? '辅助功能权限已授权'
+                : '请在系统设置中打开 JoyDSH 的辅助功能权限')
+            } catch (err) {
+              setVoiceTestStatus(`权限申请失败：${errorMessage(err)}`)
+            } finally {
+              setVoicePermissionBusy(false)
+            }
+          }}
+          onTestVoiceKey={async () => {
+            try {
+              await simulateKeyAction(voiceConfig.targetKey, 'tap', voiceConfig.customKeyCode)
+              setVoiceTestStatus(`已发送模拟按键：${voiceConfig.targetKey}`)
+            } catch (err) {
+              setVoiceTestStatus(`模拟失败：${errorMessage(err)}`)
+            }
+          }}
+          uiPreferences={uiPreferences}
+          appearanceColorDraft={appearanceColorDraft}
+          appearanceGradientDraft={appearanceGradientDraft}
+          appearancePresets={appearancePresets}
+          appearanceBusy={appearanceBusy}
+          onSetTheme={setUiTheme}
+          onSetBackground={setUiBackground}
+          onResetBackground={resetUiBackground}
+          onChangeColorDraft={setAppearanceColorDraft}
+          onChangeGradientDraft={setAppearanceGradientDraft}
+          onPickCustomBackground={() => void pickCustomBackground()}
+          settingsError={settingsError}
+          settingsMessage={settingsMessage}
+          appearanceError={appearanceError}
+          onClose={closeSettings}
+        />
       ) : null}
       {gamepadSelect === null ? null : (
         <GamepadSelectOverlay

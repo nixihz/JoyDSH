@@ -86,4 +86,14 @@ describe('MarkdownContent', () => {
     expect(html).toContain('src="https://example.com/arch.png"')
     expect(html).toContain('alt="架构图"')
   })
+
+  it('单行无语言标记的代码块依然正确渲染为 CodeBlock 容器', () => {
+    const md = '```\nissue 和 Sub-issue; 用于登记需求、缺陷、调研、代码审查或运维工作\n```'
+    const html = renderToString(<MarkdownContent content={md} />)
+
+    expect(html).toContain('markdown-code-block')
+    expect(html).toContain('markdown-code-block__pre')
+    expect(html).toContain('issue 和 Sub-issue; 用于登记需求、缺陷、调研、代码审查或运维工作')
+    expect(html).toContain('复制代码')
+  })
 })

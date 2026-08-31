@@ -94,6 +94,22 @@ function MarkdownImage({ src, alt, onPreview }: MarkdownImageProps) {
   )
 }
 
+function extractCodeBlock(children: React.ReactNode): { language?: string | undefined; value: string } | null {
+  if (!children || typeof children !== 'object' || !('props' in children)) return null
+  const codeProps = (children as { props?: { className?: string; children?: React.ReactNode } }).props
+  if (!codeProps) return null
+  const match = /language-([a-zA-Z0-9_-]+)/.exec(codeProps.className || '')
+  const raw = typeof codeProps.children === 'string'
+    ? codeProps.children
+    : Array.isArray(codeProps.children)
+      ? codeProps.children.join('')
+      : ''
+  return {
+    language: match?.[1],
+    value: raw.replace(/\n$/, ''),
+  }
+}
+
 export interface MarkdownContentProps {
   content: string
   className?: string
@@ -110,24 +126,19 @@ export const MarkdownContent = memo(function MarkdownContent({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          code({ className: codeClassName, children, ...props }) {
-            const match = /language-(\w+)/.exec(codeClassName || '')
-            const isCodeBlock = match !== null || (typeof children === 'string' && children.includes('\n'))
-
-            if (isCodeBlock) {
-              const codeString = String(children).replace(/\n$/, '')
-              return <CodeBlock language={match?.[1]} value={codeString} />
+          pre({ children }) {
+            const extracted = extractCodeBlock(children)
+            if (extracted) {
+              return <CodeBlock language={extracted.language} value={extracted.value} />
             }
-
+            return <pre className="markdown-code-block__pre">{children}</pre>
+          },
+          code({ className: codeClassName, children, ...props }) {
             return (
-              <code className="markdown-inline-code" {...props}>
+              <code className={codeClassName ? `markdown-inline-code ${codeClassName}` : 'markdown-inline-code'} {...props}>
                 {children}
               </code>
             )
-          },
-          pre({ children }) {
-            // Unwrap pre because CodeBlock provides its own container
-            return <>{children}</>
           },
           img({ src, alt }) {
             return <MarkdownImage src={src} alt={alt} onPreview={onPreviewImage} />
